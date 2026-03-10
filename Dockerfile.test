@@ -1,0 +1,12 @@
+FROM rust:1.72-bookworm
+
+RUN apt-get update && apt-get install -y \
+    mdadm lvm2 e2fsprogs gdisk kmod \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /puddle
+COPY . .
+
+RUN cargo build --release
+
+CMD ["cargo", "test", "--features", "integration", "--test", "integration_test", "--", "--nocapture"]
