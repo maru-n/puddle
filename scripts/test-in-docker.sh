@@ -176,11 +176,6 @@ umount /mnt/pool
 echo "PASS: data accessible after remove"
 
 echo ""
-echo "=== puddle generate-systemd ==="
-/puddle/target/release/puddle generate-systemd | head -5
-echo "PASS: generate-systemd OK"
-
-echo ""
 echo "=== puddle destroy ==="
 /puddle/target/release/puddle destroy --yes
 echo "PASS: destroy OK"

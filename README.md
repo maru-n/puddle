@@ -99,14 +99,20 @@ sudo puddle monitor
 # 監視間隔を変更 (120秒)
 sudo puddle monitor --interval 120
 
-# webhook 通知の設定
-sudo puddle notify --webhook https://hooks.slack.com/services/...
+# webhook 通知付き継続監視 (異常検知時に HTTP POST)
+sudo puddle monitor --webhook https://hooks.slack.com/services/...
+```
 
-# テスト通知を送信
-sudo puddle notify --webhook https://hooks.slack.com/services/... --test
+### systemd サービス (自動監視)
 
-# systemd ユニットファイルの生成
-sudo puddle generate-systemd > /etc/systemd/system/puddled.service
+`apt install puddle` 等でインストールすると、`puddled.service` が自動で有効化され、バックグラウンドで SMART + RAID の継続監視が始まる (sshd と同様)。
+
+手動でサービスを管理する場合:
+
+```bash
+sudo systemctl status puddled    # 状態確認
+sudo systemctl restart puddled   # 再起動
+sudo systemctl stop puddled      # 停止
 ```
 
 ### 動作要件
@@ -161,8 +167,6 @@ mount /dev/mapper/puddle--pool-data /mnt/recovery
 | `puddle remove <device>` | ディスクを安全に除去 |
 | `puddle destroy` | プールを破棄 |
 | `puddle monitor` | SMART + RAID 継続監視 |
-| `puddle notify --webhook <url>` | webhook 通知を設定 |
-| `puddle generate-systemd` | systemd ユニットファイルを出力 |
 
 主要オプション:
 - `--yes` — 確認プロンプトをスキップ
@@ -170,6 +174,7 @@ mount /dev/mapper/puddle--pool-data /mnt/recovery
 - `--redundancy dual` — init 時にデュアル冗長 (RAID6) を指定
 - `--once` — monitor を1回だけ実行
 - `--interval N` — monitor のポーリング間隔 (秒)
+- `--webhook URL` — monitor で異常検知時に webhook 通知
 
 ## 開発状況
 

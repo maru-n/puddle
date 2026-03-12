@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::Result;
 
 use crate::executor::command_runner::CommandRunner;
@@ -23,30 +21,6 @@ pub enum DaemonEvent {
     SmartOk { device: String },
     /// RAID チェック正常完了
     RaidOk { array: String },
-}
-
-/// デーモンの設定
-#[derive(Debug, Clone)]
-pub struct DaemonConfig {
-    /// SMART ポーリング間隔
-    pub smart_interval: Duration,
-    /// mdstat ポーリング間隔
-    pub mdstat_interval: Duration,
-    /// 監視対象デバイス
-    pub devices: Vec<String>,
-    /// メタデータディレクトリ
-    pub meta_dir: String,
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            smart_interval: Duration::from_secs(60),
-            mdstat_interval: Duration::from_secs(10),
-            devices: Vec::new(),
-            meta_dir: "/var/lib/puddle".to_string(),
-        }
-    }
 }
 
 /// 1台のディスクの SMART をチェックし、異常があればイベントを返す
@@ -219,25 +193,6 @@ pub fn send_webhook<R: CommandRunner>(
     )?;
 
     Ok(())
-}
-
-/// systemd ユニットファイルの内容を生成する
-pub fn generate_systemd_unit(exec_path: &str) -> String {
-    format!(
-        r#"[Unit]
-Description=puddle storage pool monitor
-After=local-fs.target mdadm.service lvm2-lvmpolld.service
-
-[Service]
-Type=simple
-ExecStart={exec_path}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#
-    )
 }
 
 #[cfg(test)]
@@ -413,23 +368,6 @@ mod tests {
             array: "md0".into(),
             percent: 50.0,
         }));
-    }
-
-    #[test]
-    fn test_generate_systemd_unit() {
-        let unit = generate_systemd_unit("/usr/local/bin/puddled");
-        assert!(unit.contains("ExecStart=/usr/local/bin/puddled"));
-        assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("After=local-fs.target"));
-        assert!(unit.contains("[Install]"));
-    }
-
-    #[test]
-    fn test_daemon_config_default() {
-        let config = DaemonConfig::default();
-        assert_eq!(config.smart_interval, Duration::from_secs(60));
-        assert_eq!(config.mdstat_interval, Duration::from_secs(10));
-        assert!(config.devices.is_empty());
     }
 
     #[test]

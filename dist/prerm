@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ]; then
+    systemctl stop puddled.service 2>/dev/null || true
+    systemctl disable puddled.service 2>/dev/null || true
+fi

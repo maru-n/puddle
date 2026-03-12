@@ -483,15 +483,17 @@ SPEC §6 に準拠した監視デーモンの基本構造。
 - systemd ユニットファイル生成
 - デーモンなしでも全 CLI 操作は独立動作
 - `puddle monitor --once` で1回実行、`puddle monitor` で継続監視
-- `puddle generate-systemd` で systemd ユニットファイル出力
-- 13 テスト (SMART チェック、mdstat パース、ポーリング、イベントフォーマット)
+- `puddle monitor --webhook <URL>` で異常検知時に HTTP POST 通知
+- プール未作成時は静かに待機 (デーモン起動後にプール作成可能)
+- systemd ユニットファイルは `dist/puddled.service` として同梱 (パッケージマネージャが配置)
+- `dist/postinst`, `dist/prerm` で apt install 時に自動有効化 (sshd 同様)
+- 14 テスト (SMART チェック、mdstat パース、ポーリング、イベントフォーマット、webhook)
 
 ### Step 26: webhook 通知 ✅
 
 異常検知時に HTTP POST で通知。
 
-- `puddle notify --webhook <URL>` で URL 保存
-- `puddle notify --webhook <URL> --test` でテスト通知送信
+- `puddle monitor --webhook <URL>` で異常検知時に自動通知
 - SMART 異常、RAID degraded イベントを JSON ペイロードで POST
 - curl コマンドで HTTP POST (外部依存なし)
 - monitor ループに統合: 警告検知時に自動通知

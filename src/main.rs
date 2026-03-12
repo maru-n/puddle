@@ -89,21 +89,9 @@ enum Commands {
         /// SMART polling interval in seconds
         #[arg(long, default_value = "60")]
         interval: u64,
-    },
-    /// Generate systemd unit file for puddled
-    GenerateSystemd {
-        /// Path to the puddle binary
-        #[arg(long, default_value = "/usr/local/bin/puddle")]
-        exec_path: String,
-    },
-    /// Configure webhook notification URL
-    Notify {
-        /// Webhook URL to POST alerts to
+        /// Webhook URL to POST alerts to on warnings
         #[arg(long)]
-        webhook: String,
-        /// Test the webhook by sending a test notification
-        #[arg(long)]
-        test: bool,
+        webhook: Option<String>,
     },
 }
 
@@ -412,63 +400,76 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Monitor { once, interval } => {
+        Commands::Monitor {
+            once,
+            interval,
+            webhook,
+        } => {
+            // プールが未作成なら待機 (デーモンとして起動された場合)
             let meta_path = format!("{}/pool.toml", META_DIR);
-            let toml_str = match std::fs::read_to_string(&meta_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
-                    std::process::exit(1);
-                }
-            };
-            let config = match PoolConfig::from_toml(&toml_str) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error: Failed to parse pool config: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            let devices: Vec<String> = config.disks.iter().map(|d| d.device_id.clone()).collect();
-
-            // webhook URL があれば読み込む
-            let notify_path = format!("{}/notify.conf", META_DIR);
-            let webhook_url = std::fs::read_to_string(&notify_path).ok();
 
             if once {
-                // 1回だけポーリングして終了
+                // --once: プールがなければエラー
+                let toml_str = match std::fs::read_to_string(&meta_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                        std::process::exit(1);
+                    }
+                };
+                let config = match PoolConfig::from_toml(&toml_str) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error: Failed to parse pool config: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let devices: Vec<String> =
+                    config.disks.iter().map(|d| d.device_id.clone()).collect();
+
                 let events = daemon::poll_once(&runner, &devices);
                 for event in &events {
                     println!("{}", daemon::format_event(event));
                 }
-                // 警告があれば webhook 通知
-                if let Some(ref url) = webhook_url {
+                if let Some(ref url) = webhook {
                     if let Err(e) = daemon::send_webhook(&runner, url, &events) {
                         eprintln!("Webhook notification failed: {:#}", e);
                     }
                 }
                 let has_warnings = events.iter().any(daemon::is_warning);
                 if has_warnings {
-                    std::process::exit(2); // 警告ありで終了コード 2
+                    std::process::exit(2);
                 }
                 Ok(())
             } else {
-                // 継続監視ループ
+                // 継続監視ループ (デーモンモード)
                 let poll_interval = std::time::Duration::from_secs(interval);
-                println!(
-                    "puddled: monitoring {} disks (interval: {}s)",
-                    devices.len(),
-                    interval
-                );
+
                 loop {
+                    // 毎回 pool.toml を読み直す (init 後に自動で検知)
+                    let devices = match std::fs::read_to_string(&meta_path)
+                        .ok()
+                        .and_then(|s| PoolConfig::from_toml(&s).ok())
+                    {
+                        Some(config) => config
+                            .disks
+                            .iter()
+                            .map(|d| d.device_id.clone())
+                            .collect::<Vec<_>>(),
+                        None => {
+                            // プール未作成 — 静かに待機
+                            std::thread::sleep(poll_interval);
+                            continue;
+                        }
+                    };
+
                     let events = daemon::poll_once(&runner, &devices);
                     for event in &events {
                         if daemon::is_warning(event) {
                             println!("{}", daemon::format_event(event));
                         }
                     }
-                    // 警告があれば webhook 通知
-                    if let Some(ref url) = webhook_url {
+                    if let Some(ref url) = webhook {
                         if let Err(e) = daemon::send_webhook(&runner, url, &events) {
                             eprintln!("Webhook notification failed: {:#}", e);
                         }
@@ -476,33 +477,6 @@ fn main() {
                     std::thread::sleep(poll_interval);
                 }
             }
-        }
-        Commands::GenerateSystemd { exec_path } => {
-            let unit = daemon::generate_systemd_unit(&format!("{} monitor", exec_path));
-            println!("{}", unit);
-            Ok(())
-        }
-        Commands::Notify { webhook, test } => {
-            // webhook URL を設定ファイルに保存
-            let notify_path = format!("{}/notify.conf", META_DIR);
-            if let Err(e) = std::fs::write(&notify_path, &webhook) {
-                eprintln!("Failed to save webhook URL to {}: {}", notify_path, e);
-                std::process::exit(1);
-            }
-            println!("Webhook URL saved: {}", webhook);
-
-            if test {
-                // テスト通知を送信
-                let test_events = vec![daemon::DaemonEvent::SmartWarning {
-                    device: "test".to_string(),
-                    message: "This is a test notification from puddle".to_string(),
-                }];
-                match daemon::send_webhook(&runner, &webhook, &test_events) {
-                    Ok(()) => println!("Test notification sent successfully."),
-                    Err(e) => eprintln!("Failed to send test notification: {:#}", e),
-                }
-            }
-            Ok(())
         }
     };
 

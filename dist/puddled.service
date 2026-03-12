@@ -1,0 +1,12 @@
+[Unit]
+Description=puddle storage pool monitor
+After=local-fs.target mdadm.service lvm2-lvmpolld.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/puddle monitor
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
