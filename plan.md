@@ -465,13 +465,14 @@ SPEC §3.2 に準拠:
 - 各ディスク数 × Redundancy 組み合わせで正しい RAID レベル
 - RAID6 の実効容量 = zone_size × (n - 2)
 
-### Step 24: `puddle set redundancy` コマンド ✅
+### Step 24: redundancy を init 時オプションに統合 ✅
 
-single ↔ dual の冗長性変更コマンド。
+~~`puddle set redundancy` コマンド~~ → 削除。
+運用中の RAID レベル変換は危険なため、init 時の `--redundancy` オプションに統合。
 
-- ゾーン再計算 + mdadm --grow --level で RAID レベル変換
-- 最小ディスク数チェック (RAID6 は 4台必要)
-- 確認プロンプト + プレビュー表示
+- `puddle init <device> --redundancy dual` で Dual 冗長プール作成
+- デフォルトは single (従来互換)
+- シンプルさと安全性を優先した設計判断
 
 ### Step 25: puddled デーモン基盤 ✅
 

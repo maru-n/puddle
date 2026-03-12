@@ -463,10 +463,8 @@ Partitions:
   /dev/sdd3  2.0 TB  puddle-z1 (RAID member)
 
 # ──── 設定 ────
-$ puddle set redundancy dual
-Converting to dual redundancy...
-  Zone 0: RAID5 → RAID6 (requires minimum 4 disks)
-  ⚠ ERROR: Not enough disks. Need at least 4, have 3.
+$ puddle init /dev/sdb --redundancy dual --mkfs ext4
+Pool 'puddle-xxxxxxxx' created. (Redundancy: Dual)
 
 $ puddle notify --webhook https://hooks.slack.com/services/...
 Notification configured.
@@ -656,7 +654,7 @@ puddle/
 │       ├── add.rs              # puddle add
 │       ├── replace.rs          # puddle replace / upgrade
 │       ├── status.rs           # puddle status / health / detail
-│       └── set.rs              # puddle set redundancy / notify
+│       └── notify.rs           # puddle notify
 │
 ├── tests/
 │   ├── planner_test.rs         # ゾーン分割の単体テスト
@@ -710,7 +708,7 @@ Phase 2 — 実用化                                目安: 2〜3週間
 Phase 3 — 堅牢化                                目安: 2〜3週間
 ───────────────────────────────────────────────
   [ ] daemon: puddled (udev + SMART + mdstat + scrub scheduler)
-  [ ] cli: set redundancy (single ↔ dual 変換)
+  [ ] init --redundancy dual (RAID6 対応)
   [ ] planner: RAID6 対応 (デュアル冗長)
   [ ] 容量計算の表示改善 (Drobo 風のビジュアル)
   [ ] man page / ドキュメント整備

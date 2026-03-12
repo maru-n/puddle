@@ -106,6 +106,30 @@ fn test_init_produces_valid_pool_config() {
     );
 }
 
+// ── init with redundancy tests ──
+
+#[test]
+fn test_init_with_dual_redundancy() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "4000000000000\n");
+    mock.set_stdout("blkid", "");
+
+    let result = commands::init_with_redundancy(
+        &mock,
+        "/dev/sdb",
+        Some("ext4"),
+        None,
+        "/tmp/puddle-test-dual",
+        Redundancy::Dual,
+    );
+
+    assert!(result.is_ok(), "init with dual failed: {:?}", result.err());
+    let config = result.unwrap();
+    assert_eq!(config.pool.redundancy, Redundancy::Dual);
+    // 1台なので SINGLE (Dual は 4台以上で初めて RAID6 になる)
+    assert_eq!(config.zones[0].raid_level, RaidLevel::Single);
+}
+
 // ── add tests ──
 
 #[test]
@@ -447,57 +471,6 @@ fn test_add_rollback_on_lvextend_failure() {
     );
 
     std::fs::remove_dir_all(&tmp_dir).ok();
-}
-
-// ── set-redundancy tests ──
-
-#[test]
-fn test_set_redundancy_single_to_dual() {
-    let mock = MockCommandRunner::new();
-
-    // 4台のプール (RAID6 に変換可能)
-    let config = make_four_disk_pool();
-
-    let tmp_dir = std::env::temp_dir().join("puddle-test-set-redundancy");
-    std::fs::create_dir_all(&tmp_dir).ok();
-
-    let result =
-        commands::set_redundancy(&mock, Redundancy::Dual, &config, tmp_dir.to_str().unwrap());
-    assert!(result.is_ok(), "set_redundancy failed: {:?}", result.err());
-
-    let new_config = result.unwrap();
-    assert_eq!(new_config.pool.redundancy, Redundancy::Dual);
-    // 4台均一なので1ゾーン RAID6
-    assert_eq!(new_config.zones[0].raid_level, RaidLevel::Raid6);
-}
-
-#[test]
-fn test_set_redundancy_dual_needs_4_disks() {
-    let mock = MockCommandRunner::new();
-
-    // 3台のプールでは RAID6 にできない (→ RAID1 ミラーになるが、エラーではない)
-    let config = make_multi_zone_pool();
-
-    let tmp_dir = std::env::temp_dir().join("puddle-test-set-redundancy-3");
-    std::fs::create_dir_all(&tmp_dir).ok();
-
-    let result =
-        commands::set_redundancy(&mock, Redundancy::Dual, &config, tmp_dir.to_str().unwrap());
-    // 3台でも Dual は設定可能 (RAID1 3台ミラーになる)
-    assert!(result.is_ok());
-
-    std::fs::remove_dir_all(&tmp_dir).ok();
-}
-
-#[test]
-fn test_set_redundancy_same_is_noop() {
-    let mock = MockCommandRunner::new();
-    let config = make_single_disk_pool(2_000_000_000_000);
-
-    let result =
-        commands::set_redundancy(&mock, Redundancy::Single, &config, "/tmp/puddle-test-noop");
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("already"));
 }
 
 // ── device validation tests ──

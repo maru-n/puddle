@@ -28,6 +28,9 @@ enum Commands {
         /// Mount point for the data volume
         #[arg(long)]
         mount: Option<String>,
+        /// Redundancy level: "single" (default) or "dual" (RAID6, requires 4+ disks)
+        #[arg(long, default_value = "single")]
+        redundancy: String,
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
@@ -78,11 +81,6 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
-    /// Set pool redundancy level
-    Set {
-        #[command(subcommand)]
-        setting: SetCommands,
-    },
     /// Run continuous monitoring daemon (SMART + RAID)
     Monitor {
         /// Run once and exit (no loop)
@@ -109,18 +107,6 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum SetCommands {
-    /// Change redundancy level (single or dual)
-    Redundancy {
-        /// Target redundancy level: "single" or "dual"
-        level: String,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        yes: bool,
-    },
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -141,13 +127,28 @@ fn main() {
             device,
             mkfs,
             mount,
+            redundancy,
             yes,
         } => {
+            let redundancy = match redundancy.as_str() {
+                "single" => Redundancy::Single,
+                "dual" => Redundancy::Dual,
+                _ => {
+                    eprintln!(
+                        "Error: Invalid redundancy level '{}'. Use 'single' or 'dual'.",
+                        redundancy
+                    );
+                    std::process::exit(1);
+                }
+            };
             if !yes {
                 println!(
                     "WARNING: This will destroy all data on {} and initialize a new pool.",
                     device
                 );
+                if redundancy == Redundancy::Dual {
+                    println!("  Redundancy: Dual (RAID6, requires 4+ disks for full protection)");
+                }
                 if !confirm("Proceed?") {
                     println!("Aborted.");
                     return;
@@ -155,7 +156,7 @@ fn main() {
             }
             let fs = mkfs.as_deref();
             let mp = mount.as_deref();
-            match commands::init(&runner, &device, fs, mp, META_DIR) {
+            match commands::init_with_redundancy(&runner, &device, fs, mp, META_DIR, redundancy) {
                 Ok(config) => {
                     print_init_result(&config);
                     Ok(())
@@ -503,65 +504,6 @@ fn main() {
             }
             Ok(())
         }
-        Commands::Set { setting } => match setting {
-            SetCommands::Redundancy { level, yes } => {
-                let new_redundancy = match level.as_str() {
-                    "single" => Redundancy::Single,
-                    "dual" => Redundancy::Dual,
-                    _ => {
-                        eprintln!(
-                            "Error: Invalid redundancy level '{}'. Use 'single' or 'dual'.",
-                            level
-                        );
-                        std::process::exit(1);
-                    }
-                };
-
-                let meta_path = format!("{}/pool.toml", META_DIR);
-                let toml_str = match std::fs::read_to_string(&meta_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
-                        std::process::exit(1);
-                    }
-                };
-                let existing = match PoolConfig::from_toml(&toml_str) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error: Failed to parse pool config: {}", e);
-                        eprintln!("The pool configuration may be corrupted.");
-                        std::process::exit(1);
-                    }
-                };
-
-                if !yes {
-                    println!(
-                        "Converting pool '{}' from {:?} to {:?} redundancy.",
-                        existing.pool.name, existing.pool.redundancy, new_redundancy
-                    );
-                    if !confirm("Proceed?") {
-                        println!("Aborted.");
-                        return;
-                    }
-                }
-
-                match commands::set_redundancy(&runner, new_redundancy, &existing, META_DIR) {
-                    Ok(config) => {
-                        println!("Redundancy set to {:?}.", config.pool.redundancy);
-                        for zone in &config.zones {
-                            println!(
-                                "  Zone {}: {:?} ({} disks)",
-                                zone.index,
-                                zone.raid_level,
-                                zone.participating_disk_uuids.len()
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        },
     };
 
     if let Err(e) = result {

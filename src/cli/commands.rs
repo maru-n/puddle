@@ -118,6 +118,24 @@ pub fn init<R: CommandRunner>(
     mount_point: Option<&str>,
     meta_dir: &str,
 ) -> Result<PoolConfig> {
+    init_with_redundancy(
+        runner,
+        device,
+        fs_type,
+        mount_point,
+        meta_dir,
+        Redundancy::Single,
+    )
+}
+
+pub fn init_with_redundancy<R: CommandRunner>(
+    runner: &R,
+    device: &str,
+    fs_type: Option<&str>,
+    mount_point: Option<&str>,
+    meta_dir: &str,
+    redundancy: Redundancy,
+) -> Result<PoolConfig> {
     // 1. デバイス情報取得
     let capacity = get_device_capacity(runner, device)?;
     let has_partitions = check_existing_partitions(runner, device)?;
@@ -133,7 +151,7 @@ pub fn init<R: CommandRunner>(
     }
 
     // 2. ゾーン計算
-    let plan = compute_zones(&[capacity], Redundancy::Single);
+    let plan = compute_zones(&[capacity], redundancy);
     let mut oplog = OperationLog::new(&format!("init {}", device));
 
     // 3. パーティション作成
@@ -259,7 +277,7 @@ pub fn init<R: CommandRunner>(
             uuid: pool_uuid,
             name: format!("puddle-{}", &pool_uuid.to_string()[..8]),
             created_at: chrono_now(),
-            redundancy: Redundancy::Single,
+            redundancy,
         },
         disks: vec![DiskMeta {
             uuid: disk_uuid,
@@ -888,98 +906,6 @@ pub fn upgrade<R: CommandRunner>(
 
     let ms = MetadataSync::new(runner);
     ms.write_metadata_with_local(&new_config, &[new_device], meta_dir)?;
-
-    oplog.commit();
-    let log_path = format!("{}/operations.log", meta_dir);
-    oplog.save_to_file(&log_path).ok();
-
-    Ok(new_config)
-}
-
-// ────────────────────────────────────────────
-// puddle set redundancy
-// ────────────────────────────────────────────
-
-/// 冗長性レベルを変更する
-///
-/// ゾーンを再計算し、mdadm --grow で RAID レベルを変換する。
-pub fn set_redundancy<R: CommandRunner>(
-    runner: &R,
-    new_redundancy: Redundancy,
-    existing: &PoolConfig,
-    meta_dir: &str,
-) -> Result<PoolConfig> {
-    if existing.pool.redundancy == new_redundancy {
-        bail!("Pool is already {:?} redundancy", new_redundancy);
-    }
-
-    // 1. 新しい冗長性でゾーン再計算
-    let capacities: Vec<u64> = existing.disks.iter().map(|d| d.capacity_bytes).collect();
-    let new_plan = compute_zones(&capacities, new_redundancy);
-    let mut oplog = OperationLog::new(&format!("set_redundancy {:?}", new_redundancy));
-
-    // 2. 各ゾーンの RAID レベルを変更
-    let rm = RaidManager::new(runner);
-    let mut new_zone_metas = Vec::new();
-
-    for new_zone in &new_plan.zones {
-        let old_zone = existing.zones.iter().find(|z| z.index == new_zone.index);
-
-        match old_zone {
-            Some(oz) => {
-                if oz.raid_level != new_zone.raid_level {
-                    run_step(
-                        runner,
-                        &mut oplog,
-                        &format!(
-                            "Convert zone {} {:?} → {:?}",
-                            oz.index, oz.raid_level, new_zone.raid_level
-                        ),
-                        &format!(
-                            "mdadm --grow {} --level={:?}",
-                            oz.md_device, new_zone.raid_level
-                        ),
-                        &format!("mdadm --grow {} --level={:?}", oz.md_device, oz.raid_level),
-                        || rm.grow_level(&oz.md_device, new_zone.raid_level, new_zone.num_disks),
-                    )?;
-                }
-
-                new_zone_metas.push(ZoneMeta {
-                    index: oz.index,
-                    start_bytes: new_zone.start_bytes,
-                    size_bytes: new_zone.size_bytes,
-                    raid_level: new_zone.raid_level,
-                    md_device: oz.md_device.clone(),
-                    participating_disk_uuids: oz.participating_disk_uuids.clone(),
-                });
-            }
-            None => {
-                // 新規ゾーンは冗長性変更では発生しない (ディスク数は同じ)
-                bail!(
-                    "Unexpected new zone {} during redundancy change",
-                    new_zone.index
-                );
-            }
-        }
-    }
-
-    // 3. 新しい PoolConfig
-    let new_config = PoolConfig {
-        pool: PoolMeta {
-            redundancy: new_redundancy,
-            ..existing.pool.clone()
-        },
-        disks: existing.disks.clone(),
-        zones: new_zone_metas,
-        lvm: existing.lvm.clone(),
-        state: existing.state.clone(),
-    };
-
-    // 4. メタデータ保存
-    std::fs::create_dir_all(meta_dir).ok();
-    let local_path = format!("{}/pool.toml", meta_dir);
-    let toml_str = new_config.to_toml()?;
-    std::fs::write(local_path, toml_str).context("Failed to write local metadata")?;
 
     oplog.commit();
     let log_path = format!("{}/operations.log", meta_dir);
