@@ -35,6 +35,18 @@ enum Commands {
     },
     /// Show pool status
     Status,
+    /// Show disk health (SMART) and RAID sync status
+    Health,
+    /// Replace a failed disk with a new one
+    Replace {
+        /// Old device to replace (e.g. /dev/sdb)
+        old_device: String,
+        /// New device to use (e.g. /dev/sde)
+        new_device: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Destroy the pool and remove all RAID/LVM structures
     Destroy {
         /// Skip confirmation prompt
@@ -110,6 +122,53 @@ fn main() {
             let config = PoolConfig::from_toml(&toml_str).unwrap();
             print_status(&config);
             Ok(())
+        }
+        Commands::Health => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let config = PoolConfig::from_toml(&toml_str).unwrap();
+            print_health(&runner, &config);
+            Ok(())
+        }
+        Commands::Replace {
+            old_device,
+            new_device,
+            yes,
+        } => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let existing = PoolConfig::from_toml(&toml_str).unwrap();
+
+            if !yes {
+                println!(
+                    "Replacing {} with {} in pool '{}'.",
+                    old_device, new_device, existing.pool.name
+                );
+                if !confirm("Proceed?") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
+
+            match commands::replace(&runner, &old_device, &new_device, &existing, META_DIR) {
+                Ok(_config) => {
+                    println!("Disk replaced successfully. RAID rebuild started.");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         Commands::Destroy { yes } => {
             let meta_path = format!("{}/pool.toml", META_DIR);
@@ -223,6 +282,72 @@ fn confirm(prompt: &str) -> bool {
     }
     let trimmed = input.trim().to_lowercase();
     trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+}
+
+fn print_health(runner: &puddle::executor::command_runner::RealCommandRunner, config: &PoolConfig) {
+    use puddle::executor::command_runner::CommandRunner;
+    use puddle::monitor::mdstat::parse_mdstat;
+    use puddle::monitor::smart::parse_smart_json;
+
+    println!("SMART Status:");
+    for disk in &config.disks {
+        match runner.run("smartctl", &["-j", &disk.device_id]) {
+            Ok(json) => match parse_smart_json(&json) {
+                Ok(info) => {
+                    let status = if info.passed { "OK" } else { "WARN" };
+                    let temp = info
+                        .temperature_celsius
+                        .map(|t| format!("{}C", t))
+                        .unwrap_or_else(|| "N/A".to_string());
+                    let realloc = info
+                        .reallocated_sectors
+                        .map(|r| format!("{}", r))
+                        .unwrap_or_else(|| "N/A".to_string());
+                    println!(
+                        "  #{} {} {} (Temp: {}, Reallocated: {})",
+                        disk.seq, info.model, status, temp, realloc
+                    );
+                }
+                Err(_) => {
+                    println!("  #{} {} [SMART parse error]", disk.seq, disk.device_id);
+                }
+            },
+            Err(_) => {
+                println!("  #{} {} [smartctl unavailable]", disk.seq, disk.device_id);
+            }
+        }
+    }
+    println!();
+
+    // RAID Sync status from /proc/mdstat
+    println!("RAID Sync:");
+    match std::fs::read_to_string("/proc/mdstat") {
+        Ok(mdstat) => {
+            let arrays = parse_mdstat(&mdstat);
+            for zone in &config.zones {
+                let md_name = zone.md_device.rsplit('/').next().unwrap_or(&zone.md_device);
+                let status = arrays.iter().find(|a| a.name == md_name);
+                match status {
+                    Some(arr) => {
+                        let state = if arr.is_clean() {
+                            "clean".to_string()
+                        } else if let Some(pct) = arr.recovery_percent {
+                            format!("rebuilding {:.1}%", pct)
+                        } else {
+                            format!("degraded [{}/{}]", arr.active_devices, arr.num_devices)
+                        };
+                        println!("  Zone {} ({:?}): {}", zone.index, zone.raid_level, state);
+                    }
+                    None => {
+                        println!("  Zone {} ({:?}): not found", zone.index, zone.raid_level);
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            println!("  /proc/mdstat not available");
+        }
+    }
 }
 
 fn print_add_result(config: &PoolConfig) {

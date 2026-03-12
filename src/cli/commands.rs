@@ -346,6 +346,139 @@ pub fn add<R: CommandRunner>(
 }
 
 // ────────────────────────────────────────────
+// puddle replace
+// ────────────────────────────────────────────
+
+/// 障害ディスクを同容量以上の新ディスクに交換する
+///
+/// 旧ディスクを全 mdadm アレイで fail → remove し、
+/// 新ディスクにパーティションを作成して各アレイに add する。
+pub fn replace<R: CommandRunner>(
+    runner: &R,
+    old_device: &str,
+    new_device: &str,
+    existing: &PoolConfig,
+    meta_dir: &str,
+) -> Result<PoolConfig> {
+    // 1. 旧ディスクを特定
+    let old_disk = existing
+        .disks
+        .iter()
+        .find(|d| d.device_id == old_device)
+        .ok_or_else(|| anyhow::anyhow!("Device {} not found in pool", old_device))?;
+
+    let old_disk_uuid = old_disk.uuid;
+    let old_seq = old_disk.seq;
+
+    // 2. 新ディスクの容量確認
+    let new_capacity = get_device_capacity(runner, new_device)?;
+    if new_capacity < old_disk.capacity_bytes {
+        bail!(
+            "New device is smaller ({}) than old device ({})",
+            new_capacity,
+            old_disk.capacity_bytes
+        );
+    }
+
+    // 3. 旧ディスクを全 mdadm アレイで fail → remove
+    let rm = RaidManager::new(runner);
+    for zone in &existing.zones {
+        if zone.participating_disk_uuids.contains(&old_disk_uuid) {
+            let old_part = partition_path(old_device, zone.index + 2);
+            rm.fail_device(&zone.md_device, &old_part).ok();
+            rm.remove_device(&zone.md_device, &old_part).ok();
+        }
+    }
+
+    // 4. 新ディスクにパーティション作成 (旧ディスクと同じゾーン構成)
+    let pm = PartitionManager::new(runner);
+    pm.wipe(new_device)?;
+    pm.create_metadata_partition(new_device)?;
+
+    // 旧ディスクが参加していたゾーンのパーティションを作成
+    let participating_zones: Vec<&ZoneMeta> = existing
+        .zones
+        .iter()
+        .filter(|z| z.participating_disk_uuids.contains(&old_disk_uuid))
+        .collect();
+
+    let zone_specs: Vec<ZoneSpec> = participating_zones
+        .iter()
+        .map(|z| ZoneSpec {
+            index: z.index,
+            start_bytes: z.start_bytes,
+            size_bytes: z.size_bytes,
+            raid_level: z.raid_level,
+            num_disks: z.participating_disk_uuids.len(),
+            effective_bytes: 0, // replace では使わない
+        })
+        .collect();
+    pm.create_zone_partitions(new_device, &zone_specs)?;
+    pm.reload_table(new_device)?;
+
+    // 5. メタデータパーティションをフォーマット
+    let meta_part = partition_path(new_device, 1);
+    let fm = FilesystemManager::new(runner);
+    fm.mkfs(&meta_part, "ext4")?;
+
+    // 6. 各 mdadm アレイに新デバイスを追加 (リビルド開始)
+    for zone in &participating_zones {
+        let new_part = partition_path(new_device, zone.index + 2);
+        rm.add_device(&zone.md_device, &new_part)?;
+    }
+
+    // 7. メタデータ更新
+    let new_disk_uuid = Uuid::new_v4();
+    let new_device_id = get_device_id(runner, new_device);
+
+    let new_disks: Vec<DiskMeta> = existing
+        .disks
+        .iter()
+        .map(|d| {
+            if d.uuid == old_disk_uuid {
+                DiskMeta {
+                    uuid: new_disk_uuid,
+                    device_id: new_device_id.clone(),
+                    capacity_bytes: new_capacity,
+                    seq: old_seq,
+                    status: DiskStatus::Active,
+                }
+            } else {
+                d.clone()
+            }
+        })
+        .collect();
+
+    let new_zones: Vec<ZoneMeta> = existing
+        .zones
+        .iter()
+        .map(|z| {
+            let mut uuids = z.participating_disk_uuids.clone();
+            if let Some(pos) = uuids.iter().position(|u| *u == old_disk_uuid) {
+                uuids[pos] = new_disk_uuid;
+            }
+            ZoneMeta {
+                participating_disk_uuids: uuids,
+                ..z.clone()
+            }
+        })
+        .collect();
+
+    let new_config = PoolConfig {
+        pool: existing.pool.clone(),
+        disks: new_disks,
+        zones: new_zones,
+        lvm: existing.lvm.clone(),
+        state: existing.state.clone(),
+    };
+
+    let ms = MetadataSync::new(runner);
+    ms.write_metadata_with_local(&new_config, &[new_device], meta_dir)?;
+
+    Ok(new_config)
+}
+
+// ────────────────────────────────────────────
 // puddle destroy
 // ────────────────────────────────────────────
 

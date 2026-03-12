@@ -272,16 +272,79 @@ Phase 1.5 追加修正 (完了):
 
 ---
 
-## Phase 1 スコープ外（意図的に後回し）
+---
 
-- replace / upgrade コマンド → Phase 2
+## Phase 2: 実用化
+
+### ゴール
+
+実ディスクでディスク交換ができる。SMART 異常を検知して表示できる。
+操作失敗時のロールバックが自動実行される。
+
+### Step 9: `puddle replace` — 同容量ディスク交換 ✅
+
+障害ディスクを同容量以上のディスクに交換する。
+
+1. 旧ディスクを全 mdadm アレイで `--fail` + `--remove`
+2. 新ディスクにパーティション作成 (旧ディスクと同じゾーン構成)
+3. 各 mdadm アレイに `--add` でリビルド開始
+4. メタデータ更新 (旧ディスクを removed、新ディスクを active に)
+
+テスト:
+- モックで正しいコマンド順序を検証
+- 旧ディスクが存在しない場合のエラーハンドリング
+
+### Step 10: `puddle upgrade` — 容量アップグレード交換
+
+旧ディスクを大容量ディスクに交換し、ゾーンを再構成する。
+
+1. replace と同様にリビルド実行
+2. リビルド完了後、新容量でゾーン再計算
+3. 新ゾーン用のパーティション追加・mdadm アレイ作成・LVM 拡張
+
+テスト:
+- 2TB → 8TB へのアップグレード時のゾーン再計算
+- リビルド中は再構成をブロック
+
+### Step 11: `puddle health` — SMART 監視 ✅
+
+smartctl を呼び出してディスク健全性を表示する。
+
+- `smartctl -j` の JSON 出力をパース
+- 温度、Reallocated Sector Count、Written bytes を表示
+- `/proc/mdstat` をパースして RAID sync 状態を表示
+
+テスト:
+- smartctl JSON 出力のモックパーステスト
+- /proc/mdstat のパーステスト
+
+### Step 12: 操作ログのロールバック自動実行
+
+Phase 1 で記録のみだった OperationLog を実際に実行する。
+
+- `init` / `add` / `replace` の各操作に OperationLog を組み込む
+- 途中ステップ失敗時、記録済みロールバックコマンドを逆順実行
+- ロールバック自体の失敗はログ出力して続行
+
+テスト:
+- モックで途中失敗 → ロールバックコマンドが逆順で呼ばれることを検証
+
+### Step 13: Docker E2E 検証 (Phase 2)
+
+Phase 2 の全機能を Docker privileged コンテナで E2E 検証。
+
+- replace: ディスク交換後にデータが読めること
+- destroy: プール削除後に mdadm/LVM が残っていないこと
+
+---
+
+## Phase 2 以降のスコープ外（意図的に後回し）
+
 - puddled デーモン → Phase 3
-- SMART 監視 → Phase 2
-- webhook / email 通知 → Phase 2
+- webhook / email 通知 → Phase 3
 - RAID6 / デュアル冗長 → Phase 3（planner の型だけ Phase 1 で用意）
-- 自動ロールバック実行 → Phase 2（Phase 1 はログ記録のみ）
 - Web UI → Phase 4
-- 縮小リプラン (pvmove) → Phase 2
+- 縮小リプラン (pvmove) → Phase 3
 
 ## 注意事項
 

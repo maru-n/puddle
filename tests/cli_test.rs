@@ -159,6 +159,109 @@ fn test_add_calls_correct_commands() {
     );
 }
 
+// ── replace tests ──
+
+#[test]
+fn test_replace_calls_fail_remove_add() {
+    let mock = MockCommandRunner::new();
+    // 新ディスクの容量 (旧と同じ)
+    mock.set_stdout("lsblk", "2000000000000\n");
+
+    let config = make_single_disk_pool(2_000_000_000_000);
+    let old_device = &config.disks[0].device_id;
+
+    let tmp_dir = std::env::temp_dir().join("puddle-test-replace");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result = commands::replace(
+        &mock,
+        old_device,
+        "/dev/sdd",
+        &config,
+        tmp_dir.to_str().unwrap(),
+    );
+
+    assert!(result.is_ok(), "replace failed: {:?}", result.err());
+
+    let h = mock.history();
+    let programs: Vec<&str> = h.iter().map(|e| e.0.as_str()).collect();
+
+    // fail → remove → partition → add の順
+    assert!(programs.contains(&"mdadm"), "should call mdadm");
+    assert!(programs.contains(&"sgdisk"), "should partition new disk");
+
+    // mdadm の呼び出し履歴に --fail と --add が含まれる
+    let mdadm_calls: Vec<_> = h.iter().filter(|(cmd, _)| cmd == "mdadm").collect();
+    let has_fail = mdadm_calls
+        .iter()
+        .any(|(_, args)| args.contains(&"--fail".to_string()));
+    let has_add = mdadm_calls
+        .iter()
+        .any(|(_, args)| args.contains(&"--add".to_string()));
+    assert!(has_fail, "should fail old device in mdadm");
+    assert!(has_add, "should add new device to mdadm");
+
+    let new_config = result.unwrap();
+    // ディスク数は変わらない (交換)
+    assert_eq!(new_config.disks.len(), 1);
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn test_replace_updates_disk_info() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+
+    let config = make_single_disk_pool(2_000_000_000_000);
+    let old_device = &config.disks[0].device_id;
+    let old_uuid = config.disks[0].uuid;
+
+    let tmp_dir = std::env::temp_dir().join("puddle-test-replace-info");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let new_config = commands::replace(
+        &mock,
+        old_device,
+        "/dev/sdd",
+        &config,
+        tmp_dir.to_str().unwrap(),
+    )
+    .unwrap();
+
+    // 旧ディスクの UUID が消え、新ディスクが入っている
+    assert!(
+        !new_config.disks.iter().any(|d| d.uuid == old_uuid),
+        "old disk should be replaced"
+    );
+    assert_eq!(new_config.disks.len(), 1);
+    assert_eq!(new_config.disks[0].status, DiskStatus::Active);
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn test_replace_old_device_not_found() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+
+    let config = make_single_disk_pool(2_000_000_000_000);
+
+    let result = commands::replace(
+        &mock,
+        "/dev/nonexistent",
+        "/dev/sdd",
+        &config,
+        "/tmp/puddle-test",
+    );
+
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("not found"),
+        "should report old device not found"
+    );
+}
+
 // ── destroy tests ──
 
 #[test]

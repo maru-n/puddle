@@ -155,6 +155,33 @@ fn test_mdadm_grow_level() {
     assert!(h[0].1.contains(&"5".to_string()));
 }
 
+#[test]
+fn test_mdadm_fail_device() {
+    let mock = MockCommandRunner::new();
+    let rm = RaidManager::new(&mock);
+
+    rm.fail_device("/dev/md/puddle-z0", "/dev/sdb2").unwrap();
+
+    let h = mock.history();
+    assert_eq!(h[0].0, "mdadm");
+    assert!(h[0].1.contains(&"--fail".to_string()));
+    assert!(h[0].1.contains(&"/dev/md/puddle-z0".to_string()));
+    assert!(h[0].1.contains(&"/dev/sdb2".to_string()));
+}
+
+#[test]
+fn test_mdadm_remove_device() {
+    let mock = MockCommandRunner::new();
+    let rm = RaidManager::new(&mock);
+
+    rm.remove_device("/dev/md/puddle-z0", "/dev/sdb2").unwrap();
+
+    let h = mock.history();
+    assert_eq!(h[0].0, "mdadm");
+    assert!(h[0].1.contains(&"--remove".to_string()));
+    assert!(h[0].1.contains(&"/dev/sdb2".to_string()));
+}
+
 // ── lvm tests ──
 
 #[test]

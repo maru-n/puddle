@@ -87,6 +87,18 @@ impl<'a, R: CommandRunner> RaidManager<'a, R> {
         Ok(())
     }
 
+    /// アレイ内のデバイスを fail 状態にする
+    pub fn fail_device(&self, md_device: &str, device: &str) -> Result<()> {
+        self.runner.run("mdadm", &["--fail", md_device, device])?;
+        Ok(())
+    }
+
+    /// アレイからデバイスを除去する (fail 状態のデバイスのみ)
+    pub fn remove_device(&self, md_device: &str, device: &str) -> Result<()> {
+        self.runner.run("mdadm", &["--remove", md_device, device])?;
+        Ok(())
+    }
+
     /// アレイを停止
     pub fn stop(&self, md_device: &str) -> Result<()> {
         self.runner.run("mdadm", &["--stop", md_device])?;
