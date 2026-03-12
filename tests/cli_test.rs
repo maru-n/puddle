@@ -449,6 +449,57 @@ fn test_add_rollback_on_lvextend_failure() {
     std::fs::remove_dir_all(&tmp_dir).ok();
 }
 
+// ── set-redundancy tests ──
+
+#[test]
+fn test_set_redundancy_single_to_dual() {
+    let mock = MockCommandRunner::new();
+
+    // 4台のプール (RAID6 に変換可能)
+    let config = make_four_disk_pool();
+
+    let tmp_dir = std::env::temp_dir().join("puddle-test-set-redundancy");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result =
+        commands::set_redundancy(&mock, Redundancy::Dual, &config, tmp_dir.to_str().unwrap());
+    assert!(result.is_ok(), "set_redundancy failed: {:?}", result.err());
+
+    let new_config = result.unwrap();
+    assert_eq!(new_config.pool.redundancy, Redundancy::Dual);
+    // 4台均一なので1ゾーン RAID6
+    assert_eq!(new_config.zones[0].raid_level, RaidLevel::Raid6);
+}
+
+#[test]
+fn test_set_redundancy_dual_needs_4_disks() {
+    let mock = MockCommandRunner::new();
+
+    // 3台のプールでは RAID6 にできない (→ RAID1 ミラーになるが、エラーではない)
+    let config = make_multi_zone_pool();
+
+    let tmp_dir = std::env::temp_dir().join("puddle-test-set-redundancy-3");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result =
+        commands::set_redundancy(&mock, Redundancy::Dual, &config, tmp_dir.to_str().unwrap());
+    // 3台でも Dual は設定可能 (RAID1 3台ミラーになる)
+    assert!(result.is_ok());
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn test_set_redundancy_same_is_noop() {
+    let mock = MockCommandRunner::new();
+    let config = make_single_disk_pool(2_000_000_000_000);
+
+    let result =
+        commands::set_redundancy(&mock, Redundancy::Single, &config, "/tmp/puddle-test-noop");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("already"));
+}
+
 // ── device validation tests ──
 
 #[test]
@@ -522,6 +573,53 @@ fn make_single_disk_pool(capacity: u64) -> PoolConfig {
             raid_level: RaidLevel::Single,
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: vec![disk_uuid],
+        }],
+        lvm: LvmMeta {
+            vg_name: "puddle-pool".to_string(),
+            lv_name: "data".to_string(),
+            filesystem: "ext4".to_string(),
+            mount_point: "/mnt/pool".to_string(),
+        },
+        state: StateMeta {
+            pool_status: PoolStatus::Healthy,
+            last_scrub: None,
+            version: 2,
+        },
+    }
+}
+
+fn make_four_disk_pool() -> PoolConfig {
+    use puddle::metadata::pool_config::*;
+    use uuid::Uuid;
+
+    let disks: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+    let pool_uuid = Uuid::new_v4();
+
+    PoolConfig {
+        pool: PoolMeta {
+            uuid: pool_uuid,
+            name: format!("puddle-{}", &pool_uuid.to_string()[..8]),
+            created_at: "2026-03-10T12:00:00Z".to_string(),
+            redundancy: Redundancy::Single,
+        },
+        disks: disks
+            .iter()
+            .enumerate()
+            .map(|(i, &uuid)| DiskMeta {
+                uuid,
+                device_id: format!("/dev/loop{}", i),
+                capacity_bytes: 4_000_000_000_000,
+                seq: i as u32,
+                status: DiskStatus::Active,
+            })
+            .collect(),
+        zones: vec![ZoneMeta {
+            index: 0,
+            start_bytes: 0,
+            size_bytes: 4_000_000_000_000,
+            raid_level: RaidLevel::Raid5,
+            md_device: "/dev/md/puddle-z0".to_string(),
+            participating_disk_uuids: disks.clone(),
         }],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),

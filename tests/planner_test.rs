@@ -218,6 +218,113 @@ fn test_replan_add_third_disk() {
     assert_eq!(diff.capacity_delta, tb(2) as i64);
 }
 
+// ── Dual Redundancy (RAID6) tests ──
+
+#[test]
+fn test_dual_single_disk_warns() {
+    let plan = compute_zones(&[tb(4)], Redundancy::Dual);
+    assert_eq!(plan.zones.len(), 1);
+    assert_eq!(plan.zones[0].raid_level, RaidLevel::Single);
+    assert!(plan
+        .warnings
+        .iter()
+        .any(|w| matches!(w, Warning::NoRedundancy { .. })));
+}
+
+#[test]
+fn test_dual_two_disks_raid1_with_warning() {
+    let plan = compute_zones(&[tb(4), tb(4)], Redundancy::Dual);
+    assert_eq!(plan.zones.len(), 1);
+    assert_eq!(plan.zones[0].raid_level, RaidLevel::Raid1);
+    // デュアル冗長不達成の警告
+    assert!(plan.warnings.iter().any(|w| matches!(
+        w,
+        Warning::InsufficientRedundancy {
+            achieved: Redundancy::Single,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn test_dual_three_disks_raid1_mirror() {
+    let plan = compute_zones(&[tb(4), tb(4), tb(4)], Redundancy::Dual);
+    assert_eq!(plan.zones.len(), 1);
+    assert_eq!(plan.zones[0].raid_level, RaidLevel::Raid1);
+    assert_eq!(plan.zones[0].num_disks, 3);
+    // 3台ミラーなので実効容量 = 1台分
+    assert_eq!(plan.zones[0].effective_bytes, tb(4));
+}
+
+#[test]
+fn test_dual_four_disks_raid6() {
+    let plan = compute_zones(&[tb(4); 4], Redundancy::Dual);
+    assert_eq!(plan.zones.len(), 1);
+    assert_eq!(plan.zones[0].raid_level, RaidLevel::Raid6);
+    assert_eq!(plan.zones[0].num_disks, 4);
+    // RAID6: 実効容量 = (4 - 2) × 4TB = 8TB
+    assert_eq!(plan.zones[0].effective_bytes, tb(8));
+    assert!(plan.warnings.is_empty());
+}
+
+#[test]
+fn test_dual_five_disks_raid6() {
+    let plan = compute_zones(&[tb(2); 5], Redundancy::Dual);
+    assert_eq!(plan.zones.len(), 1);
+    assert_eq!(plan.zones[0].raid_level, RaidLevel::Raid6);
+    assert_eq!(plan.zones[0].num_disks, 5);
+    // RAID6: (5 - 2) × 2TB = 6TB
+    assert_eq!(plan.zones[0].effective_bytes, tb(6));
+}
+
+#[test]
+fn test_dual_mixed_disks_zones() {
+    // 2TB + 4TB × 3 = Zone0 (4台 RAID6 × 2TB) + Zone1 (3台 RAID1 × 2TB)
+    let plan = compute_zones(&[tb(2), tb(4), tb(4), tb(4)], Redundancy::Dual);
+    assert_eq!(plan.zones.len(), 2);
+
+    // Zone 0: 4台 × 2TB, RAID6
+    assert_eq!(plan.zones[0].raid_level, RaidLevel::Raid6);
+    assert_eq!(plan.zones[0].num_disks, 4);
+    assert_eq!(plan.zones[0].effective_bytes, tb(4)); // (4-2) × 2TB
+
+    // Zone 1: 3台 × 2TB, RAID1 (3台ミラー)
+    assert_eq!(plan.zones[1].raid_level, RaidLevel::Raid1);
+    assert_eq!(plan.zones[1].num_disks, 3);
+    assert_eq!(plan.zones[1].effective_bytes, tb(2)); // ミラー = 1台分
+}
+
+#[test]
+fn test_dual_effective_less_than_single() {
+    // デュアル冗長は常にシングル冗長より実効容量が小さい (4台以上)
+    let caps = vec![tb(4); 5];
+    let single = compute_zones(&caps, Redundancy::Single);
+    let dual = compute_zones(&caps, Redundancy::Dual);
+
+    assert!(
+        dual.total_effective_bytes < single.total_effective_bytes,
+        "dual {} should be less than single {}",
+        dual.total_effective_bytes,
+        single.total_effective_bytes
+    );
+}
+
+#[test]
+fn test_dual_gradual_expansion() {
+    // 1台→2台→3台→4台の段階的拡張 (Dual)
+    let plan1 = compute_zones(&[tb(4)], Redundancy::Dual);
+    assert_eq!(plan1.zones[0].raid_level, RaidLevel::Single);
+
+    let plan2 = compute_zones(&[tb(4); 2], Redundancy::Dual);
+    assert_eq!(plan2.zones[0].raid_level, RaidLevel::Raid1);
+
+    let plan3 = compute_zones(&[tb(4); 3], Redundancy::Dual);
+    assert_eq!(plan3.zones[0].raid_level, RaidLevel::Raid1); // 3台ミラー
+
+    let plan4 = compute_zones(&[tb(4); 4], Redundancy::Dual);
+    assert_eq!(plan4.zones[0].raid_level, RaidLevel::Raid6); // ここで RAID6 に
+}
+
 #[test]
 fn test_replan_no_change() {
     let disks = vec![tb(4), tb(4), tb(4)];

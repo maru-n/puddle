@@ -3,6 +3,7 @@ use puddle::cli::commands;
 use puddle::executor::command_runner::RealCommandRunner;
 use puddle::lock::PuddleLock;
 use puddle::metadata::pool_config::PoolConfig;
+use puddle::types::Redundancy;
 
 const META_DIR: &str = "/var/lib/puddle";
 const LOCK_FILE: &str = "/var/lib/puddle/puddle.lock";
@@ -64,6 +65,23 @@ enum Commands {
     },
     /// Destroy the pool and remove all RAID/LVM structures
     Destroy {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Set pool redundancy level
+    Set {
+        #[command(subcommand)]
+        setting: SetCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetCommands {
+    /// Change redundancy level (single or dual)
+    Redundancy {
+        /// Target redundancy level: "single" or "dual"
+        level: String,
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
@@ -317,6 +335,65 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Set { setting } => match setting {
+            SetCommands::Redundancy { level, yes } => {
+                let new_redundancy = match level.as_str() {
+                    "single" => Redundancy::Single,
+                    "dual" => Redundancy::Dual,
+                    _ => {
+                        eprintln!(
+                            "Error: Invalid redundancy level '{}'. Use 'single' or 'dual'.",
+                            level
+                        );
+                        std::process::exit(1);
+                    }
+                };
+
+                let meta_path = format!("{}/pool.toml", META_DIR);
+                let toml_str = match std::fs::read_to_string(&meta_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                        std::process::exit(1);
+                    }
+                };
+                let existing = match PoolConfig::from_toml(&toml_str) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error: Failed to parse pool config: {}", e);
+                        eprintln!("The pool configuration may be corrupted.");
+                        std::process::exit(1);
+                    }
+                };
+
+                if !yes {
+                    println!(
+                        "Converting pool '{}' from {:?} to {:?} redundancy.",
+                        existing.pool.name, existing.pool.redundancy, new_redundancy
+                    );
+                    if !confirm("Proceed?") {
+                        println!("Aborted.");
+                        return;
+                    }
+                }
+
+                match commands::set_redundancy(&runner, new_redundancy, &existing, META_DIR) {
+                    Ok(config) => {
+                        println!("Redundancy set to {:?}.", config.pool.redundancy);
+                        for zone in &config.zones {
+                            println!(
+                                "  Zone {}: {:?} ({} disks)",
+                                zone.index,
+                                zone.raid_level,
+                                zone.participating_disk_uuids.len()
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        },
     };
 
     if let Err(e) = result {
