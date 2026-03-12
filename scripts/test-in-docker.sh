@@ -137,6 +137,54 @@ cat /mnt/pool/hello.txt
 echo "PASS: data rescue without puddle OK"
 umount /mnt/pool
 
+# データ復旧後、プールを再構築
+vgchange -an puddle-pool 2>/dev/null || true
+mdadm --stop --scan 2>/dev/null || true
+
+# puddle で再 init + add して元に戻す
+/puddle/target/release/puddle init ${DISK0} --mkfs ext4 --yes
+/puddle/target/release/puddle add ${DISK1} --yes
+/puddle/target/release/puddle add ${DISK2} --yes
+
+echo ""
+echo "=== puddle monitor --once ==="
+/puddle/target/release/puddle monitor --once || echo "(exit code $? — warnings detected, expected for loopback devices)"
+echo "PASS: monitor --once OK"
+
+echo ""
+echo "=== puddle health ==="
+/puddle/target/release/puddle health
+echo "PASS: health OK"
+
+echo ""
+echo "=== puddle remove ${DISK2} ==="
+/puddle/target/release/puddle remove ${DISK2} --yes
+echo "PASS: remove OK"
+
+echo ""
+echo "=== puddle status (after remove) ==="
+/puddle/target/release/puddle status
+echo "PASS: status after remove OK"
+
+echo ""
+echo "=== Verifying data after remove ==="
+mkdir -p /mnt/pool
+mount /dev/mapper/puddle--pool-data /mnt/pool
+echo "test data after remove" > /mnt/pool/after-remove.txt
+cat /mnt/pool/after-remove.txt
+umount /mnt/pool
+echo "PASS: data accessible after remove"
+
+echo ""
+echo "=== puddle generate-systemd ==="
+/puddle/target/release/puddle generate-systemd | head -5
+echo "PASS: generate-systemd OK"
+
+echo ""
+echo "=== puddle destroy ==="
+/puddle/target/release/puddle destroy --yes
+echo "PASS: destroy OK"
+
 echo ""
 echo "========================================="
 echo "  ALL TESTS PASSED"

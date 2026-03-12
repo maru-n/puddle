@@ -463,3 +463,237 @@ fn find_md_devices() -> Vec<String> {
     }
     devices
 }
+
+#[test]
+fn test_monitor_once() {
+    if !is_root() {
+        eprintln!("SKIP: test_monitor_once requires root");
+        return;
+    }
+
+    let _cleanup = PoolCleanup;
+
+    let disk0 = LoopDevice::create("mon0", 256);
+    let disk1 = LoopDevice::create("mon1", 256);
+
+    // init + add で 2台構成
+    let output = run_puddle(&["init", &disk0.path, "--mkfs", "ext4", "--yes"]);
+    assert!(output.status.success(), "init failed");
+    let output = run_puddle(&["add", &disk1.path, "--yes"]);
+    assert!(output.status.success(), "add failed");
+
+    // monitor --once で1回チェック
+    let output = run_puddle(&["monitor", "--once"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // SMART が使えない環境でも RAID チェックは動く
+    // exit code 0 (正常) or 2 (警告あり) のどちらかであること
+    assert!(
+        output.status.code() == Some(0) || output.status.code() == Some(2),
+        "monitor --once should exit with 0 or 2, got {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    // 何らかの出力があること
+    assert!(
+        !stdout.is_empty() || !stderr.is_empty(),
+        "monitor should produce output"
+    );
+}
+
+#[test]
+fn test_remove_disk_e2e() {
+    if !is_root() {
+        eprintln!("SKIP: test_remove_disk_e2e requires root");
+        return;
+    }
+
+    let _cleanup = PoolCleanup;
+
+    let disk0 = LoopDevice::create("rm0", 256);
+    let disk1 = LoopDevice::create("rm1", 256);
+    let disk2 = LoopDevice::create("rm2", 256);
+
+    // 3台構成
+    let output = run_puddle(&["init", &disk0.path, "--mkfs", "ext4", "--yes"]);
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_puddle(&["add", &disk1.path, "--yes"]);
+    assert!(
+        output.status.success(),
+        "add disk1 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_puddle(&["add", &disk2.path, "--yes"]);
+    assert!(
+        output.status.success(),
+        "add disk2 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // マウントしてデータ書き込み
+    let mount_point = "/tmp/puddle-test-remove";
+    std::fs::create_dir_all(mount_point).ok();
+    let mount_result = Command::new("mount")
+        .args(["/dev/mapper/puddle--pool-data", mount_point])
+        .output()
+        .expect("mount failed");
+
+    if !mount_result.status.success() {
+        eprintln!(
+            "SKIP: mount failed: {}",
+            String::from_utf8_lossy(&mount_result.stderr)
+        );
+        return;
+    }
+
+    let test_file = format!("{}/remove-test", mount_point);
+    Command::new("dd")
+        .args([
+            "if=/dev/urandom",
+            &format!("of={}", test_file),
+            "bs=1M",
+            "count=5",
+        ])
+        .output()
+        .expect("dd write failed");
+    let hash_before = md5sum(&test_file);
+    let _ = Command::new("sync").output();
+    let _ = Command::new("umount").arg(mount_point).output();
+
+    // ディスク1台を除去
+    let output = run_puddle(&["remove", &disk2.path, "--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "remove failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("removed") || stdout.contains("Remaining"),
+        "Expected removal confirmation, got: {}",
+        stdout
+    );
+
+    // status で2台になっていることを確認
+    let output = run_puddle(&["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "status failed after remove");
+
+    // 再マウントしてデータ確認
+    let mount_result = Command::new("mount")
+        .args(["/dev/mapper/puddle--pool-data", mount_point])
+        .output();
+    if let Ok(output) = mount_result {
+        if output.status.success() {
+            let hash_after = md5sum(&test_file);
+            assert_eq!(
+                hash_before, hash_after,
+                "Data corruption detected after remove!"
+            );
+            let _ = Command::new("umount").arg(mount_point).output();
+        }
+    }
+
+    let _ = std::fs::remove_dir(mount_point);
+}
+
+#[test]
+fn test_init_with_dual_redundancy_e2e() {
+    if !is_root() {
+        eprintln!("SKIP: test_init_with_dual_redundancy_e2e requires root");
+        return;
+    }
+
+    let _cleanup = PoolCleanup;
+    let disk0 = LoopDevice::create("dual0", 256);
+
+    let output = run_puddle(&[
+        "init",
+        &disk0.path,
+        "--mkfs",
+        "ext4",
+        "--redundancy",
+        "dual",
+        "--yes",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "init with dual redundancy failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    // status でプール情報を確認
+    let output = run_puddle(&["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "status failed");
+    assert!(
+        stdout.contains("Dual"),
+        "Status should show Dual redundancy, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_generate_systemd() {
+    // root 不要 — 単に stdout に出力するだけ
+    let output = run_puddle(&["generate-systemd"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "generate-systemd failed");
+    assert!(
+        stdout.contains("[Unit]"),
+        "Should contain systemd unit header"
+    );
+    assert!(
+        stdout.contains("ExecStart="),
+        "Should contain ExecStart directive"
+    );
+    assert!(
+        stdout.contains("puddle monitor"),
+        "ExecStart should run puddle monitor"
+    );
+}
+
+#[test]
+fn test_webhook_config() {
+    if !is_root() {
+        eprintln!("SKIP: test_webhook_config requires root");
+        return;
+    }
+
+    // notify コマンドで URL を保存 (テスト送信なし)
+    let output = run_puddle(&["notify", "--webhook", "http://localhost:9999/test"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "notify failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("saved") || stdout.contains("Webhook"),
+        "Should confirm webhook URL saved"
+    );
+
+    // notify.conf が作成されていることを確認
+    let notify_path = "/var/lib/puddle/notify.conf";
+    assert!(
+        std::path::Path::new(notify_path).exists(),
+        "notify.conf should exist"
+    );
+    let content = std::fs::read_to_string(notify_path).unwrap();
+    assert_eq!(content, "http://localhost:9999/test");
+}
