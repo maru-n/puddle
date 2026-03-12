@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 use puddle::cli::commands;
 use puddle::executor::command_runner::RealCommandRunner;
+use puddle::lock::PuddleLock;
 use puddle::metadata::pool_config::PoolConfig;
 
 const META_DIR: &str = "/var/lib/puddle";
+const LOCK_FILE: &str = "/var/lib/puddle/puddle.lock";
 
 #[derive(Parser)]
 #[command(name = "puddle", version, about = "Heterogeneous disk pool manager")]
@@ -24,6 +26,9 @@ enum Commands {
         /// Mount point for the data volume
         #[arg(long)]
         mount: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
     /// Add a disk to an existing pool
     Add {
@@ -67,6 +72,17 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+
+    // 排他ロック取得 (ディレクトリが存在しない場合は作成)
+    std::fs::create_dir_all(META_DIR).ok();
+    let _lock = match PuddleLock::try_acquire(LOCK_FILE) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let runner = RealCommandRunner;
 
     let result = match cli.command {
@@ -74,7 +90,18 @@ fn main() {
             device,
             mkfs,
             mount,
+            yes,
         } => {
+            if !yes {
+                println!(
+                    "WARNING: This will destroy all data on {} and initialize a new pool.",
+                    device
+                );
+                if !confirm("Proceed?") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
             let fs = mkfs.as_deref();
             let mp = mount.as_deref();
             match commands::init(&runner, &device, fs, mp, META_DIR) {
@@ -95,7 +122,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let existing = PoolConfig::from_toml(&toml_str).unwrap();
+            let existing = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
 
             // プレビュー表示 + 確認プロンプト
             match commands::preview_add(&runner, &device, &existing) {
@@ -129,7 +163,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let config = PoolConfig::from_toml(&toml_str).unwrap();
+            let config = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
             print_status(&config);
             Ok(())
         }
@@ -142,7 +183,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let config = PoolConfig::from_toml(&toml_str).unwrap();
+            let config = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
             print_health(&runner, &config);
             Ok(())
         }
@@ -159,7 +207,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let existing = PoolConfig::from_toml(&toml_str).unwrap();
+            let existing = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
 
             if !yes {
                 println!(
@@ -193,7 +248,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let existing = PoolConfig::from_toml(&toml_str).unwrap();
+            let existing = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
 
             if !yes {
                 println!(
@@ -225,7 +287,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let config = PoolConfig::from_toml(&toml_str).unwrap();
+            let config = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
 
             if !yes {
                 println!(

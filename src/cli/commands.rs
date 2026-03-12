@@ -6,6 +6,7 @@ use crate::executor::filesystem::FilesystemManager;
 use crate::executor::lvm::VolumeManager;
 use crate::executor::mdadm::RaidManager;
 use crate::executor::partition::PartitionManager;
+use crate::executor::rollback::OperationLog;
 use crate::metadata::pool_config::*;
 use crate::metadata::sync::MetadataSync;
 use crate::planner::zone::compute_zones;
@@ -27,6 +28,15 @@ fn check_existing_partitions<R: CommandRunner>(runner: &R, device: &str) -> Resu
     match result {
         Ok(output) => Ok(!output.trim().is_empty()),
         Err(_) => Ok(false), // blkid がエラー = パーティションなし
+    }
+}
+
+/// デバイスがマウント中かどうか確認する
+fn check_device_mounted<R: CommandRunner>(runner: &R, device: &str) -> Result<bool> {
+    let result = runner.run("findmnt", &["-rno", "SOURCE", device]);
+    match result {
+        Ok(output) => Ok(!output.trim().is_empty()),
+        Err(_) => Ok(false), // findmnt がエラー = マウントされていない
     }
 }
 
@@ -72,6 +82,32 @@ fn lv_path(vg_name: &str, lv_name: &str) -> String {
 // puddle init
 // ────────────────────────────────────────────
 
+/// 操作ステップを実行し、成功したらロールバック情報を記録する。
+/// 失敗した場合はロールバックを自動実行してからエラーを返す。
+fn run_step<R: CommandRunner, F: FnOnce() -> Result<()>>(
+    runner: &R,
+    log: &mut OperationLog,
+    description: &str,
+    command_desc: &str,
+    rollback_cmd: &str,
+    step_fn: F,
+) -> Result<()> {
+    match step_fn() {
+        Ok(()) => {
+            log.log_step(description, command_desc, rollback_cmd);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Step failed: {} — {}", description, e);
+            eprintln!("Executing rollback...");
+            if let Err(rb_err) = log.execute_rollback(runner) {
+                eprintln!("WARNING: Rollback also failed: {}", rb_err);
+            }
+            Err(e.context(format!("Failed at step: {}", description)))
+        }
+    }
+}
+
 /// プールを初期化する
 ///
 /// meta_dir: メタデータ(pool.toml)保存先ディレクトリパス
@@ -91,9 +127,14 @@ pub fn init<R: CommandRunner>(
             device
         );
     }
+    let is_mounted = check_device_mounted(runner, device)?;
+    if is_mounted {
+        bail!("Device {} is currently mounted. Unmount it first.", device);
+    }
 
     // 2. ゾーン計算
     let plan = compute_zones(&[capacity], Redundancy::Single);
+    let mut oplog = OperationLog::new(&format!("init {}", device));
 
     // 3. パーティション作成
     let pm = PartitionManager::new(runner);
@@ -101,11 +142,23 @@ pub fn init<R: CommandRunner>(
     pm.create_metadata_partition(device)?;
     pm.create_zone_partitions(device, &plan.zones)?;
     pm.reload_table(device)?;
+    oplog.log_step(
+        "Create partitions",
+        &format!("sgdisk {}", device),
+        &format!("sgdisk --zap-all {}", device),
+    );
 
     // 4. メタデータパーティションをフォーマット
     let meta_part = partition_path(device, 1);
     let fm = FilesystemManager::new(runner);
-    fm.mkfs(&meta_part, "ext4")?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Format metadata partition",
+        &format!("mkfs.ext4 {}", meta_part),
+        "", // wipe で消えるのでロールバック不要
+        || fm.mkfs(&meta_part, "ext4"),
+    )?;
 
     // 5. RAID アレイ作成
     let rm = RaidManager::new(runner);
@@ -117,7 +170,14 @@ pub fn init<R: CommandRunner>(
     for zone in &plan.zones {
         let md_dev = md_device_name(zone.index);
         let zone_part = partition_path(device, zone.index + 2);
-        rm.create_array(&md_dev, zone.raid_level, &[&zone_part])?;
+        run_step(
+            runner,
+            &mut oplog,
+            &format!("Create RAID array {}", md_dev),
+            &format!("mdadm --create {}", md_dev),
+            &format!("mdadm --stop {}", md_dev),
+            || rm.create_array(&md_dev, zone.raid_level, &[&zone_part]),
+        )?;
 
         zone_metas.push(ZoneMeta {
             index: zone.index,
@@ -137,24 +197,60 @@ pub fn init<R: CommandRunner>(
     let md_devices: Vec<String> = plan.zones.iter().map(|z| md_device_name(z.index)).collect();
 
     for md_dev in &md_devices {
-        vm.pvcreate(md_dev)?;
+        run_step(
+            runner,
+            &mut oplog,
+            &format!("Create PV on {}", md_dev),
+            &format!("pvcreate {}", md_dev),
+            &format!("pvremove -f {}", md_dev),
+            || vm.pvcreate(md_dev),
+        )?;
     }
 
     let pv_refs: Vec<&str> = md_devices.iter().map(|s| s.as_str()).collect();
-    vm.vgcreate(vg_name, &pv_refs)?;
-    vm.lvcreate_full(vg_name, lv_name)?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Create volume group",
+        &format!("vgcreate {} ...", vg_name),
+        &format!("vgremove -f {}", vg_name),
+        || vm.vgcreate(vg_name, &pv_refs),
+    )?;
+
+    let data_lv = lv_path(vg_name, lv_name);
+    run_step(
+        runner,
+        &mut oplog,
+        "Create logical volume",
+        &format!("lvcreate {}/{}", vg_name, lv_name),
+        &format!("lvremove -f {}", data_lv),
+        || vm.lvcreate_full(vg_name, lv_name),
+    )?;
 
     // 7. データ FS 作成
-    let data_lv = lv_path(vg_name, lv_name);
     let filesystem = fs_type.unwrap_or("ext4");
     if fs_type.is_some() {
-        fm.mkfs(&data_lv, filesystem)?;
+        run_step(
+            runner,
+            &mut oplog,
+            "Create filesystem",
+            &format!("mkfs.{} {}", filesystem, data_lv),
+            "", // LV 削除で消えるのでロールバック不要
+            || fm.mkfs(&data_lv, filesystem),
+        )?;
     }
 
     // 8. マウント (指定時)
     let mp = mount_point.unwrap_or("/mnt/pool");
     if mount_point.is_some() {
-        fm.mount(&data_lv, mp)?;
+        run_step(
+            runner,
+            &mut oplog,
+            "Mount filesystem",
+            &format!("mount {} {}", data_lv, mp),
+            &format!("umount {}", mp),
+            || fm.mount(&data_lv, mp),
+        )?;
     }
 
     // 9. PoolConfig 生成
@@ -189,6 +285,11 @@ pub fn init<R: CommandRunner>(
     // 10. メタデータ保存 (ディスク + ローカルキャッシュ)
     let ms = MetadataSync::new(runner);
     ms.write_metadata_with_local(&config, &[device], meta_dir)?;
+
+    // 11. 操作ログ保存
+    oplog.commit();
+    let log_path = format!("{}/operations.log", meta_dir);
+    oplog.save_to_file(&log_path).ok();
 
     Ok(config)
 }
@@ -238,15 +339,25 @@ pub fn add<R: CommandRunner>(
     existing: &PoolConfig,
     meta_dir: &str,
 ) -> Result<PoolConfig> {
+    // 0. 重複チェック
+    let device_id = get_device_id(runner, device);
+    if existing
+        .disks
+        .iter()
+        .any(|d| d.device_id == device_id || d.device_id == device)
+    {
+        bail!("Device {} is already in pool", device);
+    }
+
     // 1. 新ディスクの容量取得
     let capacity = get_device_capacity(runner, device)?;
-    let device_id = get_device_id(runner, device);
     let new_disk_uuid = Uuid::new_v4();
 
     // 2. 新しいディスク構成でゾーン再計算
     let mut all_capacities: Vec<u64> = existing.disks.iter().map(|d| d.capacity_bytes).collect();
     all_capacities.push(capacity);
     let new_plan = compute_zones(&all_capacities, existing.pool.redundancy);
+    let mut oplog = OperationLog::new(&format!("add {}", device));
 
     // 3. 新ディスクにパーティション作成
     let pm = PartitionManager::new(runner);
@@ -254,11 +365,23 @@ pub fn add<R: CommandRunner>(
     pm.create_metadata_partition(device)?;
     pm.create_zone_partitions(device, &new_plan.zones)?;
     pm.reload_table(device)?;
+    oplog.log_step(
+        "Create partitions on new disk",
+        &format!("sgdisk {}", device),
+        &format!("sgdisk --zap-all {}", device),
+    );
 
     // 4. メタデータパーティションをフォーマット
     let meta_part = partition_path(device, 1);
     let fm = FilesystemManager::new(runner);
-    fm.mkfs(&meta_part, "ext4")?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Format metadata partition",
+        &format!("mkfs.ext4 {}", meta_part),
+        "",
+        || fm.mkfs(&meta_part, "ext4"),
+    )?;
 
     // 5. RAID アレイの更新
     let rm = RaidManager::new(runner);
@@ -274,10 +397,19 @@ pub fn add<R: CommandRunner>(
         match old_zone {
             Some(oz) => {
                 // 既存ゾーン: デバイス追加 + grow
-                rm.add_device(&md_dev, &zone_part)?;
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Add device to {}", md_dev),
+                    &format!("mdadm --add {} {}", md_dev, zone_part),
+                    &format!(
+                        "mdadm --fail {} {} && mdadm --remove {} {}",
+                        md_dev, zone_part, md_dev, zone_part
+                    ),
+                    || rm.add_device(&md_dev, &zone_part),
+                )?;
 
                 if oz.raid_level != new_zone.raid_level {
-                    // RAID レベル変更 (例: RAID1 → RAID5)
                     rm.grow_level(&md_dev, new_zone.raid_level, new_zone.num_disks)?;
                 } else if new_zone.num_disks > oz.participating_disk_uuids.len() {
                     rm.grow(&md_dev, new_zone.num_disks)?;
@@ -296,9 +428,32 @@ pub fn add<R: CommandRunner>(
             }
             None => {
                 // 新規ゾーン: アレイ作成 + LVM 拡張
-                rm.create_array(&md_dev, new_zone.raid_level, &[&zone_part])?;
-                vm.pvcreate(&md_dev)?;
-                vm.vgextend(&existing.lvm.vg_name, &md_dev)?;
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Create new RAID array {}", md_dev),
+                    &format!("mdadm --create {}", md_dev),
+                    &format!("mdadm --stop {}", md_dev),
+                    || rm.create_array(&md_dev, new_zone.raid_level, &[&zone_part]),
+                )?;
+
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Create PV on {}", md_dev),
+                    &format!("pvcreate {}", md_dev),
+                    &format!("pvremove -f {}", md_dev),
+                    || vm.pvcreate(&md_dev),
+                )?;
+
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Extend VG with {}", md_dev),
+                    &format!("vgextend {} {}", existing.lvm.vg_name, md_dev),
+                    &format!("vgreduce {} {}", existing.lvm.vg_name, md_dev),
+                    || vm.vgextend(&existing.lvm.vg_name, &md_dev),
+                )?;
 
                 new_zone_metas.push(ZoneMeta {
                     index: new_zone.index,
@@ -314,8 +469,23 @@ pub fn add<R: CommandRunner>(
 
     // 6. LV 拡張 + FS リサイズ
     let data_lv = lv_path(&existing.lvm.vg_name, &existing.lvm.lv_name);
-    vm.lvextend_full(&data_lv)?;
-    fm.resize(&data_lv, &existing.lvm.filesystem)?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Extend logical volume",
+        &format!("lvextend {}", data_lv),
+        "", // LV 縮小は危険なのでロールバック対象外
+        || vm.lvextend_full(&data_lv),
+    )?;
+
+    run_step(
+        runner,
+        &mut oplog,
+        "Resize filesystem",
+        &format!("resize2fs {}", data_lv),
+        "",
+        || fm.resize(&data_lv, &existing.lvm.filesystem),
+    )?;
 
     // 7. 新しい PoolConfig を生成
     let mut new_disks = existing.disks.clone();
@@ -337,10 +507,13 @@ pub fn add<R: CommandRunner>(
     };
 
     // 8. メタデータ保存 (新ディスク + ローカルキャッシュ)
-    // Phase 1 では新ディスクのパスのみに書き込む
-    // (既存ディスクのデバイスパスは PoolConfig に保持されていないため)
     let ms = MetadataSync::new(runner);
     ms.write_metadata_with_local(&new_config, &[device], meta_dir)?;
+
+    // 9. 操作ログ保存
+    oplog.commit();
+    let log_path = format!("{}/operations.log", meta_dir);
+    oplog.save_to_file(&log_path).ok();
 
     Ok(new_config)
 }
@@ -382,6 +555,8 @@ pub fn replace<R: CommandRunner>(
 
     // 3. 旧ディスクを全 mdadm アレイで fail → remove
     let rm = RaidManager::new(runner);
+    let mut oplog = OperationLog::new(&format!("replace {} {}", old_device, new_device));
+
     for zone in &existing.zones {
         if zone.participating_disk_uuids.contains(&old_disk_uuid) {
             let old_part = partition_path(old_device, zone.index + 2);
@@ -395,7 +570,6 @@ pub fn replace<R: CommandRunner>(
     pm.wipe(new_device)?;
     pm.create_metadata_partition(new_device)?;
 
-    // 旧ディスクが参加していたゾーンのパーティションを作成
     let participating_zones: Vec<&ZoneMeta> = existing
         .zones
         .iter()
@@ -410,21 +584,43 @@ pub fn replace<R: CommandRunner>(
             size_bytes: z.size_bytes,
             raid_level: z.raid_level,
             num_disks: z.participating_disk_uuids.len(),
-            effective_bytes: 0, // replace では使わない
+            effective_bytes: 0,
         })
         .collect();
     pm.create_zone_partitions(new_device, &zone_specs)?;
     pm.reload_table(new_device)?;
+    oplog.log_step(
+        "Create partitions on new disk",
+        &format!("sgdisk {}", new_device),
+        &format!("sgdisk --zap-all {}", new_device),
+    );
 
     // 5. メタデータパーティションをフォーマット
     let meta_part = partition_path(new_device, 1);
     let fm = FilesystemManager::new(runner);
-    fm.mkfs(&meta_part, "ext4")?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Format metadata partition",
+        &format!("mkfs.ext4 {}", meta_part),
+        "",
+        || fm.mkfs(&meta_part, "ext4"),
+    )?;
 
     // 6. 各 mdadm アレイに新デバイスを追加 (リビルド開始)
     for zone in &participating_zones {
         let new_part = partition_path(new_device, zone.index + 2);
-        rm.add_device(&zone.md_device, &new_part)?;
+        run_step(
+            runner,
+            &mut oplog,
+            &format!("Add to RAID {}", zone.md_device),
+            &format!("mdadm --add {} {}", zone.md_device, new_part),
+            &format!(
+                "mdadm --fail {} {} && mdadm --remove {} {}",
+                zone.md_device, new_part, zone.md_device, new_part
+            ),
+            || rm.add_device(&zone.md_device, &new_part),
+        )?;
     }
 
     // 7. メタデータ更新
@@ -475,6 +671,10 @@ pub fn replace<R: CommandRunner>(
     let ms = MetadataSync::new(runner);
     ms.write_metadata_with_local(&new_config, &[new_device], meta_dir)?;
 
+    oplog.commit();
+    let log_path = format!("{}/operations.log", meta_dir);
+    oplog.save_to_file(&log_path).ok();
+
     Ok(new_config)
 }
 
@@ -515,6 +715,8 @@ pub fn upgrade<R: CommandRunner>(
 
     // 3. 旧ディスクを全 mdadm アレイで fail → remove
     let rm = RaidManager::new(runner);
+    let mut oplog = OperationLog::new(&format!("upgrade {} {}", old_device, new_device));
+
     for zone in &existing.zones {
         if zone.participating_disk_uuids.contains(&old_disk_uuid) {
             let old_part = partition_path(old_device, zone.index + 2);
@@ -554,11 +756,23 @@ pub fn upgrade<R: CommandRunner>(
     pm.create_metadata_partition(new_device)?;
     pm.create_zone_partitions(new_device, &new_plan.zones)?;
     pm.reload_table(new_device)?;
+    oplog.log_step(
+        "Create partitions on new disk",
+        &format!("sgdisk {}", new_device),
+        &format!("sgdisk --zap-all {}", new_device),
+    );
 
     // 6. メタデータパーティションをフォーマット
     let meta_part = partition_path(new_device, 1);
     let fm = FilesystemManager::new(runner);
-    fm.mkfs(&meta_part, "ext4")?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Format metadata partition",
+        &format!("mkfs.ext4 {}", meta_part),
+        "",
+        || fm.mkfs(&meta_part, "ext4"),
+    )?;
 
     // 7. 各 mdadm アレイの更新
     let vm = VolumeManager::new(runner);
@@ -572,10 +786,18 @@ pub fn upgrade<R: CommandRunner>(
 
         match old_zone {
             Some(oz) => {
-                // 既存ゾーン: 新デバイスを追加 (リビルド)
-                rm.add_device(&md_dev, &new_part)?;
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Add device to {}", md_dev),
+                    &format!("mdadm --add {} {}", md_dev, new_part),
+                    &format!(
+                        "mdadm --fail {} {} && mdadm --remove {} {}",
+                        md_dev, new_part, md_dev, new_part
+                    ),
+                    || rm.add_device(&md_dev, &new_part),
+                )?;
 
-                // RAID レベルや台数変更が必要な場合
                 if oz.raid_level != new_zone.raid_level {
                     rm.grow_level(&md_dev, new_zone.raid_level, new_zone.num_disks)?;
                 } else if new_zone.num_disks != oz.participating_disk_uuids.len() {
@@ -596,10 +818,32 @@ pub fn upgrade<R: CommandRunner>(
                 });
             }
             None => {
-                // 新規ゾーン (容量増分)
-                rm.create_array(&md_dev, new_zone.raid_level, &[&new_part])?;
-                vm.pvcreate(&md_dev)?;
-                vm.vgextend(&existing.lvm.vg_name, &md_dev)?;
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Create new RAID array {}", md_dev),
+                    &format!("mdadm --create {}", md_dev),
+                    &format!("mdadm --stop {}", md_dev),
+                    || rm.create_array(&md_dev, new_zone.raid_level, &[&new_part]),
+                )?;
+
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Create PV on {}", md_dev),
+                    &format!("pvcreate {}", md_dev),
+                    &format!("pvremove -f {}", md_dev),
+                    || vm.pvcreate(&md_dev),
+                )?;
+
+                run_step(
+                    runner,
+                    &mut oplog,
+                    &format!("Extend VG with {}", md_dev),
+                    &format!("vgextend {} {}", existing.lvm.vg_name, md_dev),
+                    &format!("vgreduce {} {}", existing.lvm.vg_name, md_dev),
+                    || vm.vgextend(&existing.lvm.vg_name, &md_dev),
+                )?;
 
                 new_zone_metas.push(ZoneMeta {
                     index: new_zone.index,
@@ -615,8 +859,23 @@ pub fn upgrade<R: CommandRunner>(
 
     // 8. LV 拡張 + FS リサイズ
     let data_lv = lv_path(&existing.lvm.vg_name, &existing.lvm.lv_name);
-    vm.lvextend_full(&data_lv)?;
-    fm.resize(&data_lv, &existing.lvm.filesystem)?;
+    run_step(
+        runner,
+        &mut oplog,
+        "Extend logical volume",
+        &format!("lvextend {}", data_lv),
+        "",
+        || vm.lvextend_full(&data_lv),
+    )?;
+
+    run_step(
+        runner,
+        &mut oplog,
+        "Resize filesystem",
+        &format!("resize2fs {}", data_lv),
+        "",
+        || fm.resize(&data_lv, &existing.lvm.filesystem),
+    )?;
 
     // 9. 新しい PoolConfig
     let new_config = PoolConfig {
@@ -629,6 +888,10 @@ pub fn upgrade<R: CommandRunner>(
 
     let ms = MetadataSync::new(runner);
     ms.write_metadata_with_local(&new_config, &[new_device], meta_dir)?;
+
+    oplog.commit();
+    let log_path = format!("{}/operations.log", meta_dir);
+    oplog.save_to_file(&log_path).ok();
 
     Ok(new_config)
 }
@@ -645,8 +908,11 @@ pub fn destroy<R: CommandRunner>(runner: &R, config: &PoolConfig) -> Result<()> 
     let fm = FilesystemManager::new(runner);
     let rm = RaidManager::new(runner);
 
-    // 1. アンマウント (マウント中の場合のみ)
-    let _ = fm.umount(&config.lvm.mount_point);
+    // 1. アンマウント (マウント中の場合)
+    if let Err(e) = fm.umount(&config.lvm.mount_point) {
+        // umount 失敗は致命的ではない (既にアンマウント済みの場合がある)
+        eprintln!("Note: umount {}: {}", config.lvm.mount_point, e);
+    }
 
     // 2. LVM 削除
     let data_lv = lv_path(&config.lvm.vg_name, &config.lvm.lv_name);

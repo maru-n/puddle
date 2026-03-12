@@ -66,7 +66,10 @@ impl<'a, R: CommandRunner> MetadataSync<'a, R> {
         // 一時マウントポイントを作成
         let tmp_dir =
             tempfile::tempdir().context("Failed to create temp dir for metadata mount")?;
-        let mount_point = tmp_dir.path().to_str().unwrap();
+        let mount_point = tmp_dir
+            .path()
+            .to_str()
+            .context("Temp dir path is not valid UTF-8")?;
 
         // マウント → 書き込み → アンマウント
         fm.mount(&meta_part, mount_point)?;
@@ -92,7 +95,10 @@ impl<'a, R: CommandRunner> MetadataSync<'a, R> {
 
         let tmp_dir =
             tempfile::tempdir().context("Failed to create temp dir for metadata mount")?;
-        let mount_point = tmp_dir.path().to_str().unwrap();
+        let mount_point = tmp_dir
+            .path()
+            .to_str()
+            .context("Temp dir path is not valid UTF-8")?;
 
         fm.mount(&meta_part, mount_point)?;
 

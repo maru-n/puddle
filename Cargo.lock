@@ -257,6 +257,7 @@ dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.2.15",
+ "libc",
  "pretty_assertions",
  "serde",
  "serde_json",

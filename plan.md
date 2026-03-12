@@ -338,12 +338,78 @@ Phase 2 の全機能を Docker privileged コンテナで E2E 検証。
 
 ---
 
-## Phase 2 以降のスコープ外（意図的に後回し）
+## Phase 2.5: 安全性強化
+
+### ゴール
+
+ストレージ操作ツールとしての安全性を確保する。
+操作失敗時の自動ロールバック、排他制御、入力検証、エラーハンドリングを実装。
+
+### Step 14: ロールバックの各コマンド組み込み ✅
+
+Phase 2 で実装した `execute_rollback()` を init/add/replace/upgrade の各コマンドに組み込む。
+操作途中で失敗した場合、それまでに実行した手順を自動で巻き戻す。
+
+- 各コマンド関数内で `OperationLog` を作成し、各ステップを `log_step()` で記録
+- ステップ失敗時に `execute_rollback()` を呼んでから error を返す
+- 成功時は `commit()` + `save_to_file()`
+
+テスト:
+- モックで途中失敗をシミュレート → ロールバックコマンドが逆順実行されることを検証
+- 成功時はロールバック実行されないことを検証
+
+### Step 15: flock による排他ロック ✅
+
+2つの puddle コマンドが同時実行されることを防止する。
+
+- `/var/lib/puddle/puddle.lock` に対する排他ロック (flock)
+- ロック取得に失敗した場合は「別の puddle プロセスが実行中」エラー
+- main.rs のコマンドディスパッチ前にロック取得、終了時に自動解放
+
+テスト:
+- ロック取得・解放の基本テスト
+- ロック競合時のエラーメッセージ検証
+
+### Step 16: unwrap() 除去とエラーハンドリング改善 ✅
+
+main.rs の `.unwrap()` 6箇所を適切なエラーハンドリングに置換。
+
+- `PoolConfig::from_toml().unwrap()` → `.context("...")?` or eprintln + exit
+- metadata/sync.rs の `.unwrap()` 2箇所も修正
+- pool.toml が破損している場合の graceful error 表示
+
+テスト:
+- 不正な TOML での graceful エラー表示テスト
+
+### Step 17: デバイス検証強化 ✅
+
+操作対象デバイスの安全性チェックを追加する。
+
+- **マウントチェック**: 操作対象デバイスがマウント中でないことを確認
+- **重複チェック**: `puddle add` で既にプールに含まれるデバイスの追加を防止
+- **init 確認プロンプト**: `puddle init` にも確認プロンプト追加 (`--yes` でスキップ)
+- **destroy の umount 強化**: `.ok()` 黙殺ではなく、失敗時にエラー報告
+
+テスト:
+- マウント中デバイスへの操作拒否テスト
+- 重複デバイス追加拒否テスト
+- init 確認プロンプトの動作テスト
+
+### Step 18: Docker E2E 検証 (Phase 2.5)
+
+安全性修正の全機能を Docker privileged コンテナで E2E 検証。
+
+- 排他ロック: 並行実行の衝突テスト
+- ロールバック: 実デバイスでの途中失敗→ロールバック検証
+
+---
+
+## Phase 3 以降のスコープ外（意図的に後回し）
 
 - puddled デーモン → Phase 3
 - webhook / email 通知 → Phase 3
 - RAID6 / デュアル冗長 → Phase 3（planner の型だけ Phase 1 で用意）
-- Web UI → Phase 4
+- リッチ CLI (TUI) → Phase 4
 - 縮小リプラン (pvmove) → Phase 3
 
 ## 注意事項

@@ -356,6 +356,142 @@ fn test_destroy_multi_zone_pool() {
     assert_eq!(mdadm_stops.len(), 2, "should stop 2 mdadm arrays");
 }
 
+// ── rollback integration tests ──
+
+#[test]
+fn test_init_rollback_on_pvcreate_failure() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+    mock.set_stdout("blkid", "");
+    // pvcreate を失敗させる (mdadm 成功後)
+    mock.set_fail("pvcreate", "pvcreate: Device not found");
+
+    let result = commands::init(
+        &mock,
+        "/dev/sdb",
+        Some("ext4"),
+        None,
+        "/tmp/puddle-test-meta",
+    );
+
+    // init は失敗するべき
+    assert!(result.is_err(), "init should fail when pvcreate fails");
+
+    // ロールバックコマンドが実行されたことを確認
+    let h = mock.history();
+    let sh_calls: Vec<_> = h.iter().filter(|(cmd, _)| cmd == "sh").collect();
+    assert!(
+        !sh_calls.is_empty(),
+        "rollback should execute sh -c commands, got history: {:?}",
+        h.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_init_success_saves_operation_log() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+    mock.set_stdout("blkid", "");
+
+    let tmp_dir = std::env::temp_dir().join("puddle-test-init-oplog");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result = commands::init(
+        &mock,
+        "/dev/sdb",
+        Some("ext4"),
+        None,
+        tmp_dir.to_str().unwrap(),
+    );
+    assert!(result.is_ok(), "init should succeed: {:?}", result.err());
+
+    // 操作ログが保存されていることを確認
+    let log_path = tmp_dir.join("operations.log");
+    assert!(log_path.exists(), "operations.log should be created");
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(content.contains("BEGIN"), "log should contain BEGIN");
+    assert!(content.contains("COMMIT"), "log should contain COMMIT");
+
+    // ロールバックは実行されない
+    let h = mock.history();
+    let sh_calls: Vec<_> = h.iter().filter(|(cmd, _)| cmd == "sh").collect();
+    assert!(
+        sh_calls.is_empty(),
+        "no rollback commands should run on success"
+    );
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn test_add_rollback_on_lvextend_failure() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "4000000000000\n");
+    // lvextend を失敗させる
+    mock.set_fail("lvextend", "lvextend: Insufficient free space");
+
+    let existing = make_single_disk_pool(2_000_000_000_000);
+    let tmp_dir = std::env::temp_dir().join("puddle-test-add-rollback");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result = commands::add(&mock, "/dev/sdc", &existing, tmp_dir.to_str().unwrap());
+
+    assert!(result.is_err(), "add should fail when lvextend fails");
+
+    // ロールバックコマンドが実行されたことを確認
+    let h = mock.history();
+    let sh_calls: Vec<_> = h.iter().filter(|(cmd, _)| cmd == "sh").collect();
+    assert!(
+        !sh_calls.is_empty(),
+        "rollback should execute sh -c commands on add failure"
+    );
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+// ── device validation tests ──
+
+#[test]
+fn test_add_rejects_duplicate_device() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+
+    // 既存プールのデバイスと同じデバイスを追加しようとする
+    let existing = make_single_disk_pool(2_000_000_000_000);
+    let dup_device = &existing.disks[0].device_id;
+
+    let result = commands::add(&mock, dup_device, &existing, "/tmp/puddle-test");
+
+    assert!(result.is_err(), "should reject duplicate device");
+    assert!(
+        result.unwrap_err().to_string().contains("already in pool"),
+        "error should mention already in pool"
+    );
+}
+
+#[test]
+fn test_check_device_mounted_rejects_mounted() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+    mock.set_stdout("blkid", "");
+    // findmnt が成功する = デバイスがマウント中
+    mock.set_stdout("findmnt", "/dev/sdb on /mnt type ext4");
+
+    let result = commands::init(
+        &mock,
+        "/dev/sdb",
+        Some("ext4"),
+        None,
+        "/tmp/puddle-test-meta",
+    );
+
+    assert!(result.is_err(), "should reject mounted device");
+    assert!(
+        result.unwrap_err().to_string().contains("mounted"),
+        "error should mention mounted"
+    );
+}
+
 // ── helpers ──
 
 fn make_single_disk_pool(capacity: u64) -> PoolConfig {
