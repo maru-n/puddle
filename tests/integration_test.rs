@@ -269,6 +269,133 @@ fn md5sum(path: &str) -> String {
         .to_string()
 }
 
+#[test]
+fn test_replace_disk() {
+    if !is_root() {
+        eprintln!("SKIP: test_replace_disk requires root");
+        return;
+    }
+
+    let _cleanup = PoolCleanup;
+
+    let disk0 = LoopDevice::create("rep0", 256);
+    let disk1 = LoopDevice::create("rep1", 256);
+    let disk_new = LoopDevice::create("rep_new", 256);
+
+    // init + add → 2台 RAID1 構成
+    let output = run_puddle(&["init", &disk0.path, "--mkfs", "ext4"]);
+    assert!(output.status.success(), "init failed");
+    let output = run_puddle(&["add", &disk1.path, "--yes"]);
+    assert!(output.status.success(), "add failed");
+
+    // マウントしてデータ書き込み
+    let mount_point = "/tmp/puddle-test-replace";
+    std::fs::create_dir_all(mount_point).ok();
+    let mount_result = Command::new("mount")
+        .args(["/dev/mapper/puddle--pool-data", mount_point])
+        .output()
+        .expect("mount failed");
+
+    if !mount_result.status.success() {
+        eprintln!(
+            "SKIP: mount failed: {}",
+            String::from_utf8_lossy(&mount_result.stderr)
+        );
+        return;
+    }
+
+    let test_file = format!("{}/replace-test", mount_point);
+    Command::new("dd")
+        .args([
+            "if=/dev/urandom",
+            &format!("of={}", test_file),
+            "bs=1M",
+            "count=5",
+        ])
+        .output()
+        .expect("dd write failed");
+    let hash_before = md5sum(&test_file);
+    let _ = Command::new("sync").output();
+    let _ = Command::new("umount").arg(mount_point).output();
+
+    // replace disk1 → disk_new
+    let output = run_puddle(&["replace", &disk1.path, &disk_new.path, "--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "replace failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    // 再マウントしてデータ確認
+    let mount_result = Command::new("mount")
+        .args(["/dev/mapper/puddle--pool-data", mount_point])
+        .output();
+    if let Ok(output) = mount_result {
+        if output.status.success() {
+            let hash_after = md5sum(&test_file);
+            assert_eq!(
+                hash_before, hash_after,
+                "Data corruption detected after replace!"
+            );
+            let _ = Command::new("umount").arg(mount_point).output();
+        }
+    }
+
+    let _ = std::fs::remove_dir(mount_point);
+}
+
+#[test]
+fn test_destroy_cleans_up_everything() {
+    if !is_root() {
+        eprintln!("SKIP: test_destroy_cleans_up_everything requires root");
+        return;
+    }
+
+    let _cleanup = PoolCleanup;
+
+    let disk0 = LoopDevice::create("dest0", 256);
+    let disk1 = LoopDevice::create("dest1", 256);
+
+    // init + add
+    let output = run_puddle(&["init", &disk0.path, "--mkfs", "ext4"]);
+    assert!(output.status.success(), "init failed");
+    let output = run_puddle(&["add", &disk1.path, "--yes"]);
+    assert!(output.status.success(), "add failed");
+
+    // destroy
+    let output = run_puddle(&["destroy", "--yes"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "destroy failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("destroyed"), "Expected 'destroyed' message");
+
+    // VG が存在しないことを確認
+    let vg_check = Command::new("vgs")
+        .arg("puddle-pool")
+        .output()
+        .expect("vgs failed");
+    assert!(
+        !vg_check.status.success(),
+        "VG puddle-pool should not exist after destroy"
+    );
+
+    // md デバイスが存在しないことを確認
+    let md_devices = find_md_devices();
+    assert!(
+        md_devices.is_empty(),
+        "MD devices should not exist after destroy: {:?}",
+        md_devices
+    );
+}
+
 fn find_md_devices() -> Vec<String> {
     let mut devices = Vec::new();
     for i in 0..10 {

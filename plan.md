@@ -329,7 +329,7 @@ Phase 1 で記録のみだった OperationLog を実際に実行する。
 テスト:
 - モックで途中失敗 → ロールバックコマンドが逆順で呼ばれることを検証
 
-### Step 13: Docker E2E 検証 (Phase 2)
+### Step 13: Docker E2E 検証 (Phase 2) ✅
 
 Phase 2 の全機能を Docker privileged コンテナで E2E 検証。
 
