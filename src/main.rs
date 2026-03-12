@@ -47,6 +47,16 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Replace a disk with a larger one and recalculate zones
+    Upgrade {
+        /// Old device to replace (e.g. /dev/sdb)
+        old_device: String,
+        /// New (larger) device (e.g. /dev/sde)
+        new_device: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Destroy the pool and remove all RAID/LVM structures
     Destroy {
         /// Skip confirmation prompt
@@ -165,6 +175,42 @@ fn main() {
             match commands::replace(&runner, &old_device, &new_device, &existing, META_DIR) {
                 Ok(_config) => {
                     println!("Disk replaced successfully. RAID rebuild started.");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Upgrade {
+            old_device,
+            new_device,
+            yes,
+        } => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let existing = PoolConfig::from_toml(&toml_str).unwrap();
+
+            if !yes {
+                println!(
+                    "Upgrading {} -> {} in pool '{}'.",
+                    old_device, new_device, existing.pool.name
+                );
+                println!("Zone layout will be recalculated after rebuild.");
+                if !confirm("Proceed?") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
+
+            match commands::upgrade(&runner, &old_device, &new_device, &existing, META_DIR) {
+                Ok(_config) => {
+                    println!("Disk upgraded successfully. RAID rebuild started.");
+                    println!("Zone layout will be recalculated after rebuild completes.");
                     Ok(())
                 }
                 Err(e) => Err(e),

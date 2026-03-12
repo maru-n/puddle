@@ -262,6 +262,60 @@ fn test_replace_old_device_not_found() {
     );
 }
 
+// ── upgrade tests ──
+
+#[test]
+fn test_upgrade_to_larger_disk() {
+    let mock = MockCommandRunner::new();
+    // 新ディスクは 8TB (旧は 2TB)
+    mock.set_stdout("lsblk", "8000000000000\n");
+
+    let config = make_multi_zone_pool();
+    let old_device = &config.disks[0].device_id; // 2TB disk
+
+    let tmp_dir = std::env::temp_dir().join("puddle-test-upgrade");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result = commands::upgrade(
+        &mock,
+        old_device,
+        "/dev/sde",
+        &config,
+        tmp_dir.to_str().unwrap(),
+    );
+
+    assert!(result.is_ok(), "upgrade failed: {:?}", result.err());
+
+    let new_config = result.unwrap();
+
+    // 新ディスクの容量が 8TB に更新されている
+    let upgraded_disk = new_config
+        .disks
+        .iter()
+        .find(|d| d.capacity_bytes == 8_000_000_000_000);
+    assert!(upgraded_disk.is_some(), "should have 8TB disk");
+
+    // ゾーン数が変わっているはず (4TB+4TB+8TB → ゾーン構成が変化)
+    assert!(new_config.zones.len() >= 2, "should have at least 2 zones");
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn test_upgrade_smaller_disk_fails() {
+    let mock = MockCommandRunner::new();
+    // 新ディスクが旧より小さい
+    mock.set_stdout("lsblk", "1000000000000\n");
+
+    let config = make_multi_zone_pool();
+    let old_device = &config.disks[0].device_id;
+
+    let result = commands::upgrade(&mock, old_device, "/dev/sde", &config, "/tmp/puddle-test");
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("smaller"));
+}
+
 // ── destroy tests ──
 
 #[test]

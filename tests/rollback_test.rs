@@ -1,3 +1,4 @@
+use puddle::executor::command_runner::MockCommandRunner;
 use puddle::executor::rollback::OperationLog;
 
 #[test]
@@ -154,4 +155,60 @@ fn test_save_appends_to_existing_file() {
     assert!(content.contains("BEGIN add_disk /dev/sdc"));
 
     std::fs::remove_dir_all(&tmp_dir).ok();
+}
+
+#[test]
+fn test_execute_rollback_runs_commands_in_reverse() {
+    let runner = MockCommandRunner::new();
+    let mut log = OperationLog::new("add_disk /dev/sdc");
+    log.log_step(
+        "Partition disk",
+        "sgdisk /dev/sdc",
+        "sgdisk --zap-all /dev/sdc",
+    );
+    log.log_step(
+        "Add to RAID",
+        "mdadm --add /dev/md/puddle-z0 /dev/sdc2",
+        "mdadm --fail --remove /dev/md/puddle-z0 /dev/sdc2",
+    );
+
+    let result = log.execute_rollback(&runner);
+    assert!(result.is_ok());
+
+    let history = runner.history();
+    assert_eq!(history.len(), 2);
+    // 逆順で実行される
+    assert_eq!(history[0].0, "sh");
+    assert_eq!(
+        history[0].1,
+        vec!["-c", "mdadm --fail --remove /dev/md/puddle-z0 /dev/sdc2"]
+    );
+    assert_eq!(history[1].0, "sh");
+    assert_eq!(history[1].1, vec!["-c", "sgdisk --zap-all /dev/sdc"]);
+}
+
+#[test]
+fn test_execute_rollback_skips_empty_commands() {
+    let runner = MockCommandRunner::new();
+    let mut log = OperationLog::new("init /dev/sdb");
+    log.log_step("Wipe", "sgdisk --zap-all /dev/sdb", "");
+    log.log_step("Partition", "sgdisk /dev/sdb", "sgdisk --zap-all /dev/sdb");
+
+    let result = log.execute_rollback(&runner);
+    assert!(result.is_ok());
+
+    let history = runner.history();
+    // 空のロールバックコマンドはスキップ
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].1, vec!["-c", "sgdisk --zap-all /dev/sdb"]);
+}
+
+#[test]
+fn test_execute_rollback_no_steps() {
+    let runner = MockCommandRunner::new();
+    let log = OperationLog::new("add_disk /dev/sdc");
+
+    let result = log.execute_rollback(&runner);
+    assert!(result.is_ok());
+    assert!(runner.history().is_empty());
 }

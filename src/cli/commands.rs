@@ -479,6 +479,161 @@ pub fn replace<R: CommandRunner>(
 }
 
 // ────────────────────────────────────────────
+// puddle upgrade
+// ────────────────────────────────────────────
+
+/// 容量アップグレード交換
+///
+/// replace と同様にリビルドを行った後、
+/// 新容量でゾーンを再計算し、新ゾーン分のアレイ作成 + LVM 拡張を行う。
+pub fn upgrade<R: CommandRunner>(
+    runner: &R,
+    old_device: &str,
+    new_device: &str,
+    existing: &PoolConfig,
+    meta_dir: &str,
+) -> Result<PoolConfig> {
+    // 1. 旧ディスクを特定
+    let old_disk = existing
+        .disks
+        .iter()
+        .find(|d| d.device_id == old_device)
+        .ok_or_else(|| anyhow::anyhow!("Device {} not found in pool", old_device))?;
+
+    let old_disk_uuid = old_disk.uuid;
+    let old_seq = old_disk.seq;
+
+    // 2. 新ディスク容量確認
+    let new_capacity = get_device_capacity(runner, new_device)?;
+    if new_capacity < old_disk.capacity_bytes {
+        bail!(
+            "New device is smaller ({}) than old device ({})",
+            new_capacity,
+            old_disk.capacity_bytes
+        );
+    }
+
+    // 3. 旧ディスクを全 mdadm アレイで fail → remove
+    let rm = RaidManager::new(runner);
+    for zone in &existing.zones {
+        if zone.participating_disk_uuids.contains(&old_disk_uuid) {
+            let old_part = partition_path(old_device, zone.index + 2);
+            rm.fail_device(&zone.md_device, &old_part).ok();
+            rm.remove_device(&zone.md_device, &old_part).ok();
+        }
+    }
+
+    // 4. 新容量でゾーン再計算
+    let new_disk_uuid = Uuid::new_v4();
+    let new_device_id = get_device_id(runner, new_device);
+
+    let new_disks: Vec<DiskMeta> = existing
+        .disks
+        .iter()
+        .map(|d| {
+            if d.uuid == old_disk_uuid {
+                DiskMeta {
+                    uuid: new_disk_uuid,
+                    device_id: new_device_id.clone(),
+                    capacity_bytes: new_capacity,
+                    seq: old_seq,
+                    status: DiskStatus::Active,
+                }
+            } else {
+                d.clone()
+            }
+        })
+        .collect();
+
+    let all_capacities: Vec<u64> = new_disks.iter().map(|d| d.capacity_bytes).collect();
+    let new_plan = compute_zones(&all_capacities, existing.pool.redundancy);
+
+    // 5. 新ディスクにパーティション作成 (新ゾーン構成で)
+    let pm = PartitionManager::new(runner);
+    pm.wipe(new_device)?;
+    pm.create_metadata_partition(new_device)?;
+    pm.create_zone_partitions(new_device, &new_plan.zones)?;
+    pm.reload_table(new_device)?;
+
+    // 6. メタデータパーティションをフォーマット
+    let meta_part = partition_path(new_device, 1);
+    let fm = FilesystemManager::new(runner);
+    fm.mkfs(&meta_part, "ext4")?;
+
+    // 7. 各 mdadm アレイの更新
+    let vm = VolumeManager::new(runner);
+    let mut new_zone_metas = Vec::new();
+
+    for new_zone in &new_plan.zones {
+        let md_dev = md_device_name(new_zone.index);
+        let new_part = partition_path(new_device, new_zone.index + 2);
+
+        let old_zone = existing.zones.iter().find(|z| z.index == new_zone.index);
+
+        match old_zone {
+            Some(oz) => {
+                // 既存ゾーン: 新デバイスを追加 (リビルド)
+                rm.add_device(&md_dev, &new_part)?;
+
+                // RAID レベルや台数変更が必要な場合
+                if oz.raid_level != new_zone.raid_level {
+                    rm.grow_level(&md_dev, new_zone.raid_level, new_zone.num_disks)?;
+                } else if new_zone.num_disks != oz.participating_disk_uuids.len() {
+                    rm.grow(&md_dev, new_zone.num_disks)?;
+                }
+
+                let mut uuids = oz.participating_disk_uuids.clone();
+                if let Some(pos) = uuids.iter().position(|u| *u == old_disk_uuid) {
+                    uuids[pos] = new_disk_uuid;
+                }
+                new_zone_metas.push(ZoneMeta {
+                    index: oz.index,
+                    start_bytes: new_zone.start_bytes,
+                    size_bytes: new_zone.size_bytes,
+                    raid_level: new_zone.raid_level,
+                    md_device: md_dev,
+                    participating_disk_uuids: uuids,
+                });
+            }
+            None => {
+                // 新規ゾーン (容量増分)
+                rm.create_array(&md_dev, new_zone.raid_level, &[&new_part])?;
+                vm.pvcreate(&md_dev)?;
+                vm.vgextend(&existing.lvm.vg_name, &md_dev)?;
+
+                new_zone_metas.push(ZoneMeta {
+                    index: new_zone.index,
+                    start_bytes: new_zone.start_bytes,
+                    size_bytes: new_zone.size_bytes,
+                    raid_level: new_zone.raid_level,
+                    md_device: md_dev,
+                    participating_disk_uuids: vec![new_disk_uuid],
+                });
+            }
+        }
+    }
+
+    // 8. LV 拡張 + FS リサイズ
+    let data_lv = lv_path(&existing.lvm.vg_name, &existing.lvm.lv_name);
+    vm.lvextend_full(&data_lv)?;
+    fm.resize(&data_lv, &existing.lvm.filesystem)?;
+
+    // 9. 新しい PoolConfig
+    let new_config = PoolConfig {
+        pool: existing.pool.clone(),
+        disks: new_disks,
+        zones: new_zone_metas,
+        lvm: existing.lvm.clone(),
+        state: existing.state.clone(),
+    };
+
+    let ms = MetadataSync::new(runner);
+    ms.write_metadata_with_local(&new_config, &[new_device], meta_dir)?;
+
+    Ok(new_config)
+}
+
+// ────────────────────────────────────────────
 // puddle destroy
 // ────────────────────────────────────────────
 

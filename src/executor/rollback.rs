@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::fs::OpenOptions;
 use std::io::Write;
 
+use super::command_runner::CommandRunner;
+
 /// 操作ステップの記録
 #[derive(Debug, Clone)]
 pub struct OperationStep {
@@ -83,6 +85,19 @@ impl OperationLog {
         }
 
         out
+    }
+
+    /// ロールバックコマンドを逆順に実行する
+    pub fn execute_rollback<R: CommandRunner>(&self, runner: &R) -> Result<()> {
+        for cmd in self.rollback_commands() {
+            if cmd.is_empty() {
+                continue;
+            }
+            runner
+                .run("sh", &["-c", cmd])
+                .context(format!("Rollback command failed: {}", cmd))?;
+        }
+        Ok(())
     }
 
     /// ログをファイルに追記保存する
