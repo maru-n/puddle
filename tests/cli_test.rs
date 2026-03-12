@@ -705,3 +705,141 @@ fn make_multi_zone_pool() -> PoolConfig {
         },
     }
 }
+
+/// 2台均等プール (remove テスト用)
+fn make_two_disk_pool() -> PoolConfig {
+    use puddle::metadata::pool_config::*;
+    use uuid::Uuid;
+
+    let disk0 = Uuid::new_v4();
+    let disk1 = Uuid::new_v4();
+    let pool_uuid = Uuid::new_v4();
+
+    PoolConfig {
+        pool: PoolMeta {
+            uuid: pool_uuid,
+            name: format!("puddle-{}", &pool_uuid.to_string()[..8]),
+            created_at: "2026-03-10T12:00:00Z".to_string(),
+            redundancy: Redundancy::Single,
+        },
+        disks: vec![
+            DiskMeta {
+                uuid: disk0,
+                device_id: "/dev/loop0".to_string(),
+                capacity_bytes: 4_000_000_000_000,
+                seq: 0,
+                status: DiskStatus::Active,
+            },
+            DiskMeta {
+                uuid: disk1,
+                device_id: "/dev/loop1".to_string(),
+                capacity_bytes: 4_000_000_000_000,
+                seq: 1,
+                status: DiskStatus::Active,
+            },
+        ],
+        zones: vec![ZoneMeta {
+            index: 0,
+            start_bytes: 0,
+            size_bytes: 4_000_000_000_000,
+            raid_level: RaidLevel::Raid1,
+            md_device: "/dev/md/puddle-z0".to_string(),
+            participating_disk_uuids: vec![disk0, disk1],
+        }],
+        lvm: LvmMeta {
+            vg_name: "puddle-pool".to_string(),
+            lv_name: "data".to_string(),
+            filesystem: "ext4".to_string(),
+            mount_point: "/mnt/pool".to_string(),
+        },
+        state: StateMeta {
+            pool_status: PoolStatus::Healthy,
+            last_scrub: None,
+            version: 2,
+        },
+    }
+}
+
+// ── remove tests ──
+
+#[test]
+fn test_remove_device_not_found() {
+    let mock = MockCommandRunner::new();
+    let pool = make_two_disk_pool();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let meta_dir = tmp.path().to_str().unwrap();
+    let meta_path = format!("{}/pool.toml", meta_dir);
+    std::fs::write(&meta_path, pool.to_toml().unwrap()).unwrap();
+
+    let result = commands::remove(&mock, "/dev/nonexistent", &pool, meta_dir);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("not found"),
+        "should error for missing device"
+    );
+}
+
+#[test]
+fn test_remove_last_disk_rejected() {
+    let mock = MockCommandRunner::new();
+    let pool = make_single_disk_pool(4_000_000_000_000);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let meta_dir = tmp.path().to_str().unwrap();
+    let meta_path = format!("{}/pool.toml", meta_dir);
+    std::fs::write(&meta_path, pool.to_toml().unwrap()).unwrap();
+
+    let result = commands::remove(&mock, "ata-TEST_DISK_0", &pool, meta_dir);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Cannot remove the last disk"));
+}
+
+#[test]
+fn test_remove_disk_from_two_disk_pool() {
+    let mock = MockCommandRunner::new();
+    let pool = make_two_disk_pool();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let meta_dir = tmp.path().to_str().unwrap();
+    let meta_path = format!("{}/pool.toml", meta_dir);
+    std::fs::write(&meta_path, pool.to_toml().unwrap()).unwrap();
+
+    let result = commands::remove(&mock, "/dev/loop1", &pool, meta_dir);
+    assert!(result.is_ok(), "remove failed: {:?}", result.err());
+
+    let new_config = result.unwrap();
+    assert_eq!(new_config.disks.len(), 1);
+    assert_eq!(new_config.disks[0].device_id, "/dev/loop0");
+
+    // pvmove, mdadm --fail, mdadm --remove が呼ばれたことを確認
+    let h = mock.history();
+    let programs: Vec<&str> = h.iter().map(|e| e.0.as_str()).collect();
+    assert!(programs.contains(&"pvmove"), "should call pvmove");
+    assert!(programs.contains(&"mdadm"), "should call mdadm");
+    assert!(programs.contains(&"sgdisk"), "should call sgdisk to wipe");
+    assert!(programs.contains(&"resize2fs"), "should resize fs");
+}
+
+#[test]
+fn test_remove_disk_from_multi_zone_pool() {
+    let mock = MockCommandRunner::new();
+    let pool = make_multi_zone_pool();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let meta_dir = tmp.path().to_str().unwrap();
+    let meta_path = format!("{}/pool.toml", meta_dir);
+    std::fs::write(&meta_path, pool.to_toml().unwrap()).unwrap();
+
+    // loop0 は zone0 (3台 RAID5) にのみ参加
+    let result = commands::remove(&mock, "/dev/loop0", &pool, meta_dir);
+    assert!(result.is_ok(), "remove failed: {:?}", result.err());
+
+    let new_config = result.unwrap();
+    assert_eq!(new_config.disks.len(), 2);
+    // loop0 が消えている
+    assert!(new_config.disks.iter().all(|d| d.device_id != "/dev/loop0"));
+}

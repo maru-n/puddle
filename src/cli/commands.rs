@@ -989,6 +989,237 @@ pub fn set_redundancy<R: CommandRunner>(
 }
 
 // ────────────────────────────────────────────
+// puddle remove
+// ────────────────────────────────────────────
+
+/// プールからディスクを安全に除去する
+///
+/// 1. pvmove でデータを退避
+/// 2. 各ゾーンから mdadm デバイスを fail + remove
+/// 3. 単独ゾーンは停止 + pvremove + vgreduce、複数台ゾーンは --grow で縮小
+/// 4. パーティションテーブル消去
+/// 5. メタデータ更新
+pub fn remove<R: CommandRunner>(
+    runner: &R,
+    device: &str,
+    existing: &PoolConfig,
+    meta_dir: &str,
+) -> Result<PoolConfig> {
+    let rm = RaidManager::new(runner);
+    let vm = VolumeManager::new(runner);
+    let pm = PartitionManager::new(runner);
+    let fm = FilesystemManager::new(runner);
+
+    // 対象ディスクの検索
+    let disk_idx = existing
+        .disks
+        .iter()
+        .position(|d| d.device_id == device)
+        .ok_or_else(|| anyhow::anyhow!("Device {} not found in pool", device))?;
+    let disk_uuid = existing.disks[disk_idx].uuid;
+
+    let mut oplog = OperationLog::new("remove");
+
+    // 残りのディスク容量でゾーンを再計算
+    let remaining_disks: Vec<&DiskMeta> = existing
+        .disks
+        .iter()
+        .filter(|d| d.uuid != disk_uuid)
+        .collect();
+
+    if remaining_disks.is_empty() {
+        bail!("Cannot remove the last disk. Use 'puddle destroy' instead.");
+    }
+
+    let remaining_caps: Vec<u64> = remaining_disks.iter().map(|d| d.capacity_bytes).collect();
+    let new_plan = compute_zones(&remaining_caps, existing.pool.redundancy);
+
+    // 各ゾーンからデバイスを除去
+    for zone in &existing.zones {
+        if !zone.participating_disk_uuids.contains(&disk_uuid) {
+            continue;
+        }
+
+        let zone_part_num = zone.index + 2; // partition numbering: 1=metadata, 2+=zones
+        let zone_part = partition_path(device, zone_part_num);
+
+        if zone.participating_disk_uuids.len() == 1 {
+            // このゾーンはこのディスクだけ → ゾーン削除
+            run_step(
+                runner,
+                &mut oplog,
+                &format!("Remove PV from VG for {}", zone.md_device),
+                &format!("vgreduce {} {}", existing.lvm.vg_name, zone.md_device),
+                &format!("vgextend {} {}", existing.lvm.vg_name, zone.md_device),
+                || vm.vgreduce(&existing.lvm.vg_name, &zone.md_device),
+            )?;
+
+            run_step(
+                runner,
+                &mut oplog,
+                &format!("Remove PV {}", zone.md_device),
+                &format!("pvremove -f {}", zone.md_device),
+                "",
+                || vm.pvremove(&zone.md_device),
+            )?;
+
+            run_step(
+                runner,
+                &mut oplog,
+                &format!("Stop array {}", zone.md_device),
+                &format!("mdadm --stop {}", zone.md_device),
+                "",
+                || rm.stop(&zone.md_device),
+            )?;
+        } else {
+            // 複数台ゾーン → pvmove + fail + remove + grow
+            run_step(
+                runner,
+                &mut oplog,
+                &format!("Evacuate data from {}", zone.md_device),
+                &format!("pvmove {}", zone.md_device),
+                "",
+                || {
+                    // pvmove は同じ VG 内の他の PV にデータを退避
+                    // 出力先は自動選択される
+                    vm.pvmove(&zone.md_device)
+                },
+            )?;
+
+            run_step(
+                runner,
+                &mut oplog,
+                &format!("Fail device {} in {}", zone_part, zone.md_device),
+                &format!("mdadm --fail {} {}", zone.md_device, zone_part),
+                "",
+                || rm.fail_device(&zone.md_device, &zone_part),
+            )?;
+
+            run_step(
+                runner,
+                &mut oplog,
+                &format!("Remove device {} from {}", zone_part, zone.md_device),
+                &format!("mdadm --remove {} {}", zone.md_device, zone_part),
+                "",
+                || rm.remove_device(&zone.md_device, &zone_part),
+            )?;
+
+            // RAID デバイス数を縮小
+            let new_count = zone.participating_disk_uuids.len() - 1;
+            if new_count >= 1 {
+                // 新しいプランに対応する RAID レベルを見つける
+                let new_zone_opt = new_plan.zones.iter().find(|z| z.index == zone.index);
+                if let Some(new_zone) = new_zone_opt {
+                    if new_zone.raid_level != zone.raid_level {
+                        run_step(
+                            runner,
+                            &mut oplog,
+                            &format!("Downgrade RAID level for {}", zone.md_device),
+                            &format!("mdadm --grow {} --level --raid-devices", zone.md_device),
+                            "",
+                            || rm.grow_level(&zone.md_device, new_zone.raid_level, new_count),
+                        )?;
+                    } else {
+                        run_step(
+                            runner,
+                            &mut oplog,
+                            &format!("Shrink array {}", zone.md_device),
+                            &format!(
+                                "mdadm --grow {} --raid-devices={}",
+                                zone.md_device, new_count
+                            ),
+                            "",
+                            || rm.grow(&zone.md_device, new_count),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    // FS リサイズ (縮小の場合は不要だが安全のため)
+    let data_lv = lv_path(&existing.lvm.vg_name, &existing.lvm.lv_name);
+    run_step(
+        runner,
+        &mut oplog,
+        "Resize filesystem",
+        &format!("resize2fs {}", data_lv),
+        "",
+        || fm.resize(&data_lv, &existing.lvm.filesystem),
+    )?;
+
+    // パーティションテーブル消去
+    run_step(
+        runner,
+        &mut oplog,
+        &format!("Wipe partition table on {}", device),
+        &format!("sgdisk --zap-all {}", device),
+        "",
+        || pm.wipe(device),
+    )?;
+
+    // 新しい PoolConfig を生成
+    let new_disks: Vec<DiskMeta> = existing
+        .disks
+        .iter()
+        .filter(|d| d.uuid != disk_uuid)
+        .cloned()
+        .collect();
+
+    let new_zone_metas: Vec<ZoneMeta> = existing
+        .zones
+        .iter()
+        .filter(|z| {
+            // 除去ディスクだけで構成されていたゾーンは除外
+            z.participating_disk_uuids.len() > 1 || !z.participating_disk_uuids.contains(&disk_uuid)
+        })
+        .map(|z| {
+            let mut zm = z.clone();
+            zm.participating_disk_uuids.retain(|u| *u != disk_uuid);
+            // 新プランからサイズ情報を更新
+            if let Some(nz) = new_plan.zones.iter().find(|nz| nz.index == z.index) {
+                zm.raid_level = nz.raid_level;
+                zm.size_bytes = nz.size_bytes;
+            }
+            zm
+        })
+        .collect();
+
+    let new_config = PoolConfig {
+        pool: existing.pool.clone(),
+        disks: new_disks.to_vec(),
+        zones: new_zone_metas,
+        lvm: existing.lvm.clone(),
+        state: StateMeta {
+            pool_status: if new_disks.len() >= 2 {
+                PoolStatus::Healthy
+            } else {
+                PoolStatus::Degraded
+            },
+            last_scrub: existing.state.last_scrub.clone(),
+            version: existing.state.version + 1,
+        },
+    };
+
+    // メタデータ保存
+    let toml_str = new_config.to_toml()?;
+    let meta_path = format!("{}/pool.toml", meta_dir);
+    std::fs::write(meta_path, toml_str).context("Failed to write pool config")?;
+
+    // ディスクメタデータ同期
+    let ms = MetadataSync::new(runner);
+    let remaining_device_ids: Vec<String> = new_disks.iter().map(|d| d.device_id.clone()).collect();
+    let device_refs: Vec<&str> = remaining_device_ids.iter().map(|s| s.as_str()).collect();
+    ms.write_metadata_with_local(&new_config, &device_refs, meta_dir)?;
+
+    oplog.commit();
+    let log_path = format!("{}/operations.log", meta_dir);
+    oplog.save_to_file(&log_path)?;
+
+    Ok(new_config)
+}
+
+// ────────────────────────────────────────────
 // puddle destroy
 // ────────────────────────────────────────────
 

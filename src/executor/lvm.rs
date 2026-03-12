@@ -41,6 +41,24 @@ impl<'a, R: CommandRunner> VolumeManager<'a, R> {
         Ok(())
     }
 
+    /// PV 上のデータを他の PV に退避する
+    pub fn pvmove(&self, pv: &str) -> Result<()> {
+        self.runner.run("pvmove", &[pv])?;
+        Ok(())
+    }
+
+    /// Volume Group から PV を除去する
+    pub fn vgreduce(&self, vg_name: &str, pv: &str) -> Result<()> {
+        self.runner.run("vgreduce", &[vg_name, pv])?;
+        Ok(())
+    }
+
+    /// Physical Volume を除去
+    pub fn pvremove(&self, pv: &str) -> Result<()> {
+        self.runner.run("pvremove", &["-f", pv])?;
+        Ok(())
+    }
+
     /// Logical Volume を拡張 (VG の全空き領域を使用)
     ///
     /// 空き領域がない場合 (RAID1ミラー追加時など) はスキップする。

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use puddle::cli::commands;
+use puddle::daemon;
 use puddle::executor::command_runner::RealCommandRunner;
 use puddle::lock::PuddleLock;
 use puddle::metadata::pool_config::PoolConfig;
@@ -63,6 +64,14 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Remove a disk from the pool (data will be evacuated first)
+    Remove {
+        /// Block device to remove (e.g. /dev/sdb)
+        device: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Destroy the pool and remove all RAID/LVM structures
     Destroy {
         /// Skip confirmation prompt
@@ -73,6 +82,30 @@ enum Commands {
     Set {
         #[command(subcommand)]
         setting: SetCommands,
+    },
+    /// Run continuous monitoring daemon (SMART + RAID)
+    Monitor {
+        /// Run once and exit (no loop)
+        #[arg(long)]
+        once: bool,
+        /// SMART polling interval in seconds
+        #[arg(long, default_value = "60")]
+        interval: u64,
+    },
+    /// Generate systemd unit file for puddled
+    GenerateSystemd {
+        /// Path to the puddle binary
+        #[arg(long, default_value = "/usr/local/bin/puddle")]
+        exec_path: String,
+    },
+    /// Configure webhook notification URL
+    Notify {
+        /// Webhook URL to POST alerts to
+        #[arg(long)]
+        webhook: String,
+        /// Test the webhook by sending a test notification
+        #[arg(long)]
+        test: bool,
     },
 }
 
@@ -296,6 +329,49 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::Remove { device, yes } => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let existing = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
+
+            if !yes {
+                println!(
+                    "Removing {} from pool '{}'. Data will be evacuated first.",
+                    device, existing.pool.name
+                );
+                println!(
+                    "Remaining disks: {}",
+                    existing.disks.len().saturating_sub(1)
+                );
+                if !confirm("Proceed?") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
+
+            match commands::remove(&runner, &device, &existing, META_DIR) {
+                Ok(config) => {
+                    println!("Disk {} removed successfully.", device);
+                    println!("  Remaining disks: {}", config.disks.len());
+                    println!("  Zones: {}", config.zones.len());
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         Commands::Destroy { yes } => {
             let meta_path = format!("{}/pool.toml", META_DIR);
             let toml_str = match std::fs::read_to_string(&meta_path) {
@@ -334,6 +410,98 @@ fn main() {
                 }
                 Err(e) => Err(e),
             }
+        }
+        Commands::Monitor { once, interval } => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let config = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let devices: Vec<String> = config.disks.iter().map(|d| d.device_id.clone()).collect();
+
+            // webhook URL があれば読み込む
+            let notify_path = format!("{}/notify.conf", META_DIR);
+            let webhook_url = std::fs::read_to_string(&notify_path).ok();
+
+            if once {
+                // 1回だけポーリングして終了
+                let events = daemon::poll_once(&runner, &devices);
+                for event in &events {
+                    println!("{}", daemon::format_event(event));
+                }
+                // 警告があれば webhook 通知
+                if let Some(ref url) = webhook_url {
+                    if let Err(e) = daemon::send_webhook(&runner, url, &events) {
+                        eprintln!("Webhook notification failed: {:#}", e);
+                    }
+                }
+                let has_warnings = events.iter().any(daemon::is_warning);
+                if has_warnings {
+                    std::process::exit(2); // 警告ありで終了コード 2
+                }
+                Ok(())
+            } else {
+                // 継続監視ループ
+                let poll_interval = std::time::Duration::from_secs(interval);
+                println!(
+                    "puddled: monitoring {} disks (interval: {}s)",
+                    devices.len(),
+                    interval
+                );
+                loop {
+                    let events = daemon::poll_once(&runner, &devices);
+                    for event in &events {
+                        if daemon::is_warning(event) {
+                            println!("{}", daemon::format_event(event));
+                        }
+                    }
+                    // 警告があれば webhook 通知
+                    if let Some(ref url) = webhook_url {
+                        if let Err(e) = daemon::send_webhook(&runner, url, &events) {
+                            eprintln!("Webhook notification failed: {:#}", e);
+                        }
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+            }
+        }
+        Commands::GenerateSystemd { exec_path } => {
+            let unit = daemon::generate_systemd_unit(&format!("{} monitor", exec_path));
+            println!("{}", unit);
+            Ok(())
+        }
+        Commands::Notify { webhook, test } => {
+            // webhook URL を設定ファイルに保存
+            let notify_path = format!("{}/notify.conf", META_DIR);
+            if let Err(e) = std::fs::write(&notify_path, &webhook) {
+                eprintln!("Failed to save webhook URL to {}: {}", notify_path, e);
+                std::process::exit(1);
+            }
+            println!("Webhook URL saved: {}", webhook);
+
+            if test {
+                // テスト通知を送信
+                let test_events = vec![daemon::DaemonEvent::SmartWarning {
+                    device: "test".to_string(),
+                    message: "This is a test notification from puddle".to_string(),
+                }];
+                match daemon::send_webhook(&runner, &webhook, &test_events) {
+                    Ok(()) => println!("Test notification sent successfully."),
+                    Err(e) => eprintln!("Failed to send test notification: {:#}", e),
+                }
+            }
+            Ok(())
         }
         Commands::Set { setting } => match setting {
             SetCommands::Redundancy { level, yes } => {
