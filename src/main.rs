@@ -68,11 +68,8 @@ fn main() {
                 }
             };
             let existing = PoolConfig::from_toml(&toml_str).unwrap();
-            match commands::add(&runner, &device, &existing) {
+            match commands::add(&runner, &device, &existing, META_DIR) {
                 Ok(config) => {
-                    // メタデータ保存
-                    let new_toml = config.to_toml().unwrap();
-                    std::fs::write(&meta_path, new_toml).unwrap();
                     print_add_result(&config);
                     Ok(())
                 }

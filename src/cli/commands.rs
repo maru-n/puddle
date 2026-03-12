@@ -7,6 +7,7 @@ use crate::executor::lvm::VolumeManager;
 use crate::executor::mdadm::RaidManager;
 use crate::executor::partition::PartitionManager;
 use crate::metadata::pool_config::*;
+use crate::metadata::sync::MetadataSync;
 use crate::planner::zone::compute_zones;
 use crate::types::*;
 
@@ -185,11 +186,9 @@ pub fn init<R: CommandRunner>(
         },
     };
 
-    // 10. メタデータ保存 (ローカルファイル)
-    let toml_str = config.to_toml()?;
-    let meta_path = format!("{}/pool.toml", meta_dir);
-    std::fs::create_dir_all(meta_dir).ok();
-    std::fs::write(meta_path, toml_str).context("Failed to write pool metadata")?;
+    // 10. メタデータ保存 (ディスク + ローカルキャッシュ)
+    let ms = MetadataSync::new(runner);
+    ms.write_metadata_with_local(&config, &[device], meta_dir)?;
 
     Ok(config)
 }
@@ -199,10 +198,13 @@ pub fn init<R: CommandRunner>(
 // ────────────────────────────────────────────
 
 /// ディスクを既存プールに追加する
+///
+/// meta_dir: メタデータ(pool.toml)保存先ディレクトリパス
 pub fn add<R: CommandRunner>(
     runner: &R,
     device: &str,
     existing: &PoolConfig,
+    meta_dir: &str,
 ) -> Result<PoolConfig> {
     // 1. 新ディスクの容量取得
     let capacity = get_device_capacity(runner, device)?;
@@ -301,6 +303,12 @@ pub fn add<R: CommandRunner>(
         lvm: existing.lvm.clone(),
         state: existing.state.clone(),
     };
+
+    // 8. メタデータ保存 (新ディスク + ローカルキャッシュ)
+    // Phase 1 では新ディスクのパスのみに書き込む
+    // (既存ディスクのデバイスパスは PoolConfig に保持されていないため)
+    let ms = MetadataSync::new(runner);
+    ms.write_metadata_with_local(&new_config, &[device], meta_dir)?;
 
     Ok(new_config)
 }

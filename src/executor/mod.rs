@@ -3,3 +3,4 @@ pub mod filesystem;
 pub mod lvm;
 pub mod mdadm;
 pub mod partition;
+pub mod rollback;

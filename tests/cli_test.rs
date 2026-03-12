@@ -107,7 +107,10 @@ fn test_add_disk_updates_zones() {
     // 既存プール: 1台 2TB
     let existing = make_single_disk_pool(2_000_000_000_000);
 
-    let result = commands::add(&mock, "/dev/sdc", &existing);
+    let tmp_dir = std::env::temp_dir().join("puddle-test-add-zones");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result = commands::add(&mock, "/dev/sdc", &existing, tmp_dir.to_str().unwrap());
 
     assert!(result.is_ok(), "add failed: {:?}", result.err());
 
@@ -118,6 +121,8 @@ fn test_add_disk_updates_zones() {
     assert_eq!(new_config.zones[0].raid_level, RaidLevel::Raid1);
     // Zone 1: SINGLE (1台 × 2TB, 大きいディスクの余り)
     assert_eq!(new_config.zones[1].raid_level, RaidLevel::Single);
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
 }
 
 #[test]
@@ -126,11 +131,15 @@ fn test_add_calls_correct_commands() {
     mock.set_stdout("lsblk", "4000000000000\n");
 
     let existing = make_single_disk_pool(2_000_000_000_000);
-    let result = commands::add(&mock, "/dev/sdc", &existing);
+    let tmp_dir = std::env::temp_dir().join("puddle-test-add-cmds");
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    let result = commands::add(&mock, "/dev/sdc", &existing, tmp_dir.to_str().unwrap());
 
     assert!(result.is_ok());
 
     let h = mock.history();
+    std::fs::remove_dir_all(&tmp_dir).ok();
     let programs: Vec<&str> = h.iter().map(|e| e.0.as_str()).collect();
 
     assert!(programs.contains(&"sgdisk"), "should partition new disk");
