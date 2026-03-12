@@ -35,6 +35,12 @@ enum Commands {
     },
     /// Show pool status
     Status,
+    /// Destroy the pool and remove all RAID/LVM structures
+    Destroy {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -57,7 +63,7 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Add { device, yes: _ } => {
+        Commands::Add { device, yes } => {
             let meta_path = format!("{}/pool.toml", META_DIR);
             let toml_str = match std::fs::read_to_string(&meta_path) {
                 Ok(s) => s,
@@ -68,6 +74,22 @@ fn main() {
                 }
             };
             let existing = PoolConfig::from_toml(&toml_str).unwrap();
+
+            // プレビュー表示 + 確認プロンプト
+            match commands::preview_add(&runner, &device, &existing) {
+                Ok(preview) => {
+                    print_add_preview(&preview);
+                    if !yes && !confirm("Proceed?") {
+                        println!("Aborted.");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to preview: {:#}", e);
+                    std::process::exit(1);
+                }
+            }
+
             match commands::add(&runner, &device, &existing, META_DIR) {
                 Ok(config) => {
                     print_add_result(&config);
@@ -89,6 +111,38 @@ fn main() {
             print_status(&config);
             Ok(())
         }
+        Commands::Destroy { yes } => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let config = PoolConfig::from_toml(&toml_str).unwrap();
+
+            if !yes {
+                println!(
+                    "WARNING: This will destroy pool '{}' and ALL data on it.",
+                    config.pool.name
+                );
+                println!("  Disks: {}", config.disks.len());
+                println!("  Zones: {}", config.zones.len());
+                if !confirm("Are you sure?") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
+
+            match commands::destroy(&runner, &config) {
+                Ok(()) => {
+                    println!("Pool '{}' destroyed.", config.pool.name);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
     };
 
     if let Err(e) = result {
@@ -103,6 +157,72 @@ fn print_init_result(config: &PoolConfig) {
         println!("WARNING: 1-disk configuration has no redundancy.");
         println!("  Add a disk: puddle add <device>");
     }
+}
+
+fn print_add_preview(preview: &commands::AddPreview) {
+    use puddle::planner::capacity::format_bytes;
+
+    println!("Planning zone layout...\n");
+
+    println!("  Current layout:");
+    for zone in &preview.current_zones {
+        let redundancy_mark = if zone.raid_level == puddle::types::RaidLevel::Single {
+            " -> no redundancy"
+        } else {
+            ""
+        };
+        println!(
+            "    Zone {}: {:?} ({} disks, {}){}",
+            zone.index,
+            zone.raid_level,
+            zone.participating_disk_uuids.len(),
+            format_bytes(zone.size_bytes),
+            redundancy_mark,
+        );
+    }
+    println!();
+
+    println!("  New layout:");
+    for zone in &preview.new_zones {
+        let redundancy_mark = if zone.raid_level == puddle::types::RaidLevel::Single {
+            " -> no redundancy"
+        } else {
+            ""
+        };
+        println!(
+            "    Zone {}: {:?} ({} disks, {}){}",
+            zone.index,
+            zone.raid_level,
+            zone.num_disks,
+            format_bytes(zone.size_bytes),
+            redundancy_mark,
+        );
+    }
+    println!();
+
+    let diff = preview.new_effective_bytes as i64 - preview.current_effective_bytes as i64;
+    let sign = if diff >= 0 { "+" } else { "" };
+    println!(
+        "  Effective capacity: {} -> {} ({}{})",
+        format_bytes(preview.current_effective_bytes),
+        format_bytes(preview.new_effective_bytes),
+        sign,
+        format_bytes(diff.unsigned_abs()),
+    );
+    println!();
+}
+
+/// ユーザーに確認を求める
+fn confirm(prompt: &str) -> bool {
+    use std::io::{self, Write};
+    print!("{} [Y/n] ", prompt);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let trimmed = input.trim().to_lowercase();
+    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
 }
 
 fn print_add_result(config: &PoolConfig) {

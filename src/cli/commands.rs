@@ -197,6 +197,38 @@ pub fn init<R: CommandRunner>(
 // puddle add
 // ────────────────────────────────────────────
 
+/// ディスク追加のプレビュー情報
+pub struct AddPreview {
+    pub current_zones: Vec<ZoneMeta>,
+    pub new_zones: Vec<crate::types::ZoneSpec>,
+    pub current_effective_bytes: u64,
+    pub new_effective_bytes: u64,
+    pub new_disk_capacity_bytes: u64,
+}
+
+/// ディスク追加のプレビューを生成する (実行はしない)
+pub fn preview_add<R: CommandRunner>(
+    runner: &R,
+    device: &str,
+    existing: &PoolConfig,
+) -> Result<AddPreview> {
+    let capacity = get_device_capacity(runner, device)?;
+
+    let mut all_capacities: Vec<u64> = existing.disks.iter().map(|d| d.capacity_bytes).collect();
+    let current_plan = compute_zones(&all_capacities, existing.pool.redundancy);
+
+    all_capacities.push(capacity);
+    let new_plan = compute_zones(&all_capacities, existing.pool.redundancy);
+
+    Ok(AddPreview {
+        current_zones: existing.zones.clone(),
+        new_zones: new_plan.zones,
+        current_effective_bytes: current_plan.total_effective_bytes,
+        new_effective_bytes: new_plan.total_effective_bytes,
+        new_disk_capacity_bytes: capacity,
+    })
+}
+
 /// ディスクを既存プールに追加する
 ///
 /// meta_dir: メタデータ(pool.toml)保存先ディレクトリパス
@@ -313,9 +345,58 @@ pub fn add<R: CommandRunner>(
     Ok(new_config)
 }
 
-/// 簡易タイムスタンプ (chrono クレートを使わず)
+// ────────────────────────────────────────────
+// puddle destroy
+// ────────────────────────────────────────────
+
+/// プールを破棄する
+///
+/// LVM → mdadm → パーティションの順に削除する。
+/// データは完全に失われる。
+pub fn destroy<R: CommandRunner>(runner: &R, config: &PoolConfig) -> Result<()> {
+    let fm = FilesystemManager::new(runner);
+    let rm = RaidManager::new(runner);
+
+    // 1. アンマウント (マウント中の場合のみ)
+    let _ = fm.umount(&config.lvm.mount_point);
+
+    // 2. LVM 削除
+    let data_lv = lv_path(&config.lvm.vg_name, &config.lvm.lv_name);
+    runner.run("lvchange", &["-an", &data_lv]).ok();
+    runner.run("lvremove", &["-f", &data_lv]).ok();
+    runner.run("vgremove", &["-f", &config.lvm.vg_name]).ok();
+
+    // 3. PV 削除 + mdadm アレイ停止
+    for zone in &config.zones {
+        runner.run("pvremove", &["-f", &zone.md_device]).ok();
+        rm.stop(&zone.md_device).ok();
+    }
+
+    // 4. パーティションテーブル消去 (全ディスク)
+    let pm = PartitionManager::new(runner);
+    for disk in &config.disks {
+        pm.wipe(&disk.device_id).ok();
+    }
+
+    // 5. ローカルメタデータ削除
+    let _ = std::fs::remove_file("/var/lib/puddle/pool.toml");
+
+    Ok(())
+}
+
+/// ISO 8601 形式の現在時刻を返す
 fn chrono_now() -> String {
-    // Phase 1 では固定値でもよいが、一応 date コマンドの結果を使う
-    // テスト環境ではこの値が使われる
-    "2026-03-10T12:00:00Z".to_string()
+    // chrono クレートを使わず、date コマンドで取得
+    std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }

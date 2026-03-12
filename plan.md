@@ -265,10 +265,10 @@ Docker 検証中に発見・修正した問題:
 - [x] `lvextend` が RAID1 ミラー追加時に "matches existing size" エラー → 容量変化なしの場合はスキップ
 - [x] `pvcreate` に `-f` フラグ追加（既存シグネチャ対応）
 
-未着手の既知の実装不備（Phase 2 以降）:
-- [ ] `chrono_now()` がハードコード — 実際のタイムスタンプを返すようにする
-- [ ] `puddle add` の確認プロンプト未実装
-- [ ] `puddle destroy` コマンドがない（クリーンアップが手動）
+Phase 1.5 追加修正 (完了):
+- [x] `chrono_now()` がハードコード → `date -u` コマンドで実際のタイムスタンプを取得
+- [x] `puddle add` の確認プロンプト → プレビュー表示 + `[Y/n]` 確認 (`--yes` でスキップ)
+- [x] `puddle destroy` コマンド → LVM/mdadm/パーティションの順に削除、確認プロンプト付き
 
 ---
 

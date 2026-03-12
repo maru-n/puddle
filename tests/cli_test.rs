@@ -95,6 +95,15 @@ fn test_init_produces_valid_pool_config() {
     assert_eq!(pool_config.zones[0].raid_level, RaidLevel::Single);
     assert_eq!(pool_config.state.pool_status, PoolStatus::Healthy);
     assert_eq!(pool_config.pool.redundancy, Redundancy::Single);
+    // created_at がハードコードでなく、実際のタイムスタンプであること
+    assert_ne!(
+        pool_config.pool.created_at, "2026-03-10T12:00:00Z",
+        "created_at should not be hardcoded"
+    );
+    assert!(
+        pool_config.pool.created_at.contains('T'),
+        "created_at should be ISO 8601 format"
+    );
 }
 
 // ── add tests ──
@@ -150,6 +159,46 @@ fn test_add_calls_correct_commands() {
     );
 }
 
+// ── destroy tests ──
+
+#[test]
+fn test_destroy_calls_correct_command_sequence() {
+    let mock = MockCommandRunner::new();
+    let config = make_single_disk_pool(2_000_000_000_000);
+
+    let result = commands::destroy(&mock, &config);
+    assert!(result.is_ok(), "destroy failed: {:?}", result.err());
+
+    let h = mock.history();
+    let programs: Vec<&str> = h.iter().map(|e| e.0.as_str()).collect();
+
+    // umount → lvchange → lvremove → vgremove → pvremove → mdadm stop → sgdisk zap
+    assert!(programs.contains(&"umount"), "should umount");
+    assert!(programs.contains(&"lvchange"), "should deactivate LV");
+    assert!(programs.contains(&"lvremove"), "should remove LV");
+    assert!(programs.contains(&"vgremove"), "should remove VG");
+    assert!(programs.contains(&"mdadm"), "should stop mdadm arrays");
+    assert!(programs.contains(&"sgdisk"), "should wipe partition tables");
+}
+
+#[test]
+fn test_destroy_multi_zone_pool() {
+    let config = make_multi_zone_pool();
+    let mock = MockCommandRunner::new();
+
+    let result = commands::destroy(&mock, &config);
+    assert!(result.is_ok(), "destroy failed: {:?}", result.err());
+
+    let h = mock.history();
+
+    // mdadm --stop が2回 (Zone 0, Zone 1)
+    let mdadm_stops: Vec<_> = h
+        .iter()
+        .filter(|(cmd, args)| cmd == "mdadm" && args.contains(&"--stop".to_string()))
+        .collect();
+    assert_eq!(mdadm_stops.len(), 2, "should stop 2 mdadm arrays");
+}
+
 // ── helpers ──
 
 fn make_single_disk_pool(capacity: u64) -> PoolConfig {
@@ -181,6 +230,77 @@ fn make_single_disk_pool(capacity: u64) -> PoolConfig {
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: vec![disk_uuid],
         }],
+        lvm: LvmMeta {
+            vg_name: "puddle-pool".to_string(),
+            lv_name: "data".to_string(),
+            filesystem: "ext4".to_string(),
+            mount_point: "/mnt/pool".to_string(),
+        },
+        state: StateMeta {
+            pool_status: PoolStatus::Healthy,
+            last_scrub: None,
+            version: 2,
+        },
+    }
+}
+
+fn make_multi_zone_pool() -> PoolConfig {
+    use puddle::metadata::pool_config::*;
+    use uuid::Uuid;
+
+    let disk0 = Uuid::new_v4();
+    let disk1 = Uuid::new_v4();
+    let disk2 = Uuid::new_v4();
+    let pool_uuid = Uuid::new_v4();
+
+    PoolConfig {
+        pool: PoolMeta {
+            uuid: pool_uuid,
+            name: format!("puddle-{}", &pool_uuid.to_string()[..8]),
+            created_at: "2026-03-10T12:00:00Z".to_string(),
+            redundancy: Redundancy::Single,
+        },
+        disks: vec![
+            DiskMeta {
+                uuid: disk0,
+                device_id: "/dev/loop0".to_string(),
+                capacity_bytes: 2_000_000_000_000,
+                seq: 0,
+                status: DiskStatus::Active,
+            },
+            DiskMeta {
+                uuid: disk1,
+                device_id: "/dev/loop1".to_string(),
+                capacity_bytes: 4_000_000_000_000,
+                seq: 1,
+                status: DiskStatus::Active,
+            },
+            DiskMeta {
+                uuid: disk2,
+                device_id: "/dev/loop2".to_string(),
+                capacity_bytes: 4_000_000_000_000,
+                seq: 2,
+                status: DiskStatus::Active,
+            },
+        ],
+        zones: vec![
+            ZoneMeta {
+                index: 0,
+                start_bytes: 0,
+                size_bytes: 2_000_000_000_000,
+                raid_level: RaidLevel::Raid5,
+                md_device: "/dev/md/puddle-z0".to_string(),
+                participating_disk_uuids: vec![disk0, disk1, disk2],
+            },
+            ZoneMeta {
+                index: 1,
+                start_bytes: 2_000_000_000_000,
+                size_bytes: 2_000_000_000_000,
+                raid_level: RaidLevel::Raid1,
+                md_device: "/dev/md/puddle-z1".to_string(),
+                participating_disk_uuids: vec![disk1, disk2],
+            },
+        ],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),
             lv_name: "data".to_string(),
