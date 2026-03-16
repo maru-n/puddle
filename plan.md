@@ -514,6 +514,102 @@ SPEC §6 に準拠した監視デーモンの基本構造。
 
 ---
 
+## Phase 3.5: 遅延割り当て (Deferred Allocation)
+
+### ゴール
+
+非冗長ゾーン (SINGLE) へのデータ書き込みを後回しにし、冗長ゾーンから先に使用する。
+ユーザーが意図しないデータ損失リスクを低減する。
+
+背景・設計判断の詳細: `docs/DESIGN_NOTES.md`
+仕様: `docs/SPEC.md` §3.5
+
+### Step 28: ZoneMeta に allocatable フィールド追加
+
+メタデータとプランナーの拡張。
+
+- `ZoneMeta` に `allocatable: bool` フィールドを追加 (デフォルト `true`)
+- `pool.toml` の TOML シリアライズ/デシリアライズ対応
+- 既存 pool.toml との後方互換: フィールドがなければ `true` として扱う
+- planner の `compute_zones` 結果に `is_redundant` 判定関数を追加
+
+テスト:
+- TOML ラウンドトリップ (allocatable フィールドあり/なし)
+- 既存 pool.toml (フィールドなし) の読み込み互換性
+- is_redundant: SINGLE=false, RAID1/5/6=true
+
+### Step 29: init / add での遅延割り当て
+
+ディスク追加時に非冗長ゾーンの PV を割り当て禁止にする。
+
+- `VolumeManager` に `pvchange_allocatable(pv, allocatable)` メソッド追加
+- `init`: 1台構成は SINGLE でも allocatable=true (使わないと保存できない)
+- `add`: 新ゾーンが SINGLE の場合:
+  - pvcreate → vgextend → pvchange -x n
+  - LV は拡張しない (冗長ゾーンだけを使用)
+  - allocatable = false でメタデータ保存
+- `add`: 既存 SINGLE ゾーンが RAID1/5 に昇格した場合:
+  - pvchange -x y で割り当て許可
+  - lvextend + resize2fs
+  - allocatable = true に更新
+
+テスト:
+- add で SINGLE ゾーン発生 → pvchange -x n 呼び出し確認
+- add で SINGLE → RAID1 昇格 → pvchange -x y + lvextend 確認
+- init 1台 → allocatable = true 確認
+
+### Step 30: `puddle expand-unprotected` コマンド
+
+非冗長領域を手動で有効化するコマンド。
+
+- 新サブコマンド `expand-unprotected`
+- 非冗長ゾーン (allocatable=false) を列挙して確認プロンプト表示
+- 承認後: pvchange -x y → lvextend → resize2fs
+- メタデータ更新: allocatable = true
+- 非冗長ゾーンがない場合はエラー: "No unprotected zones to expand"
+- `--yes` で確認スキップ
+
+テスト:
+- 基本フロー (pvchange → lvextend → resize2fs の呼び出し順序)
+- 非冗長ゾーンなし → エラー
+- 既に有効化済み → エラー
+
+### Step 31: status 表示の改善
+
+Protected / Unprotected 容量の区別表示。
+
+- `puddle status` で冗長/非冗長の容量を分けて表示
+- 非冗長ゾーンは `[reserved — no redundancy]` or `[active — NO REDUNDANCY]` と表示
+- Capacity セクションに Protected / Unprotected 行を追加
+
+テスト:
+- status 出力に reserved / unprotected 表示が含まれることを検証
+
+### Step 32: monitor での使用率監視
+
+冗長領域の使用率がしきい値を超えたら警告。
+
+- `DaemonEvent` に `StorageThreshold` イベント追加
+- `poll_once` で冗長ゾーンの空き容量を `vgs` で確認
+- 使用率 90% 超過時にログ出力 + webhook 通知
+- メッセージ例: "Protected storage is 92% full. Run 'puddle expand-unprotected' to use 2.0 TB of unprotected storage."
+
+テスト:
+- 使用率 89% → イベントなし
+- 使用率 91% → StorageThreshold イベント発生
+- webhook ペイロードに expand-unprotected の案内が含まれる
+
+### Step 33: E2E テスト・ドキュメント更新
+
+- Docker E2E テストに遅延割り当てシナリオを追加:
+  - 異種容量ディスクで add → SINGLE ゾーンが reserved
+  - 冗長ゾーンにデータ書き込み → 非冗長ゾーンは未使用
+  - expand-unprotected → 非冗長ゾーンが使用可能に
+- README.md に遅延割り当ての説明を追加
+- plan.md 更新
+
+---
+
 ## Phase 4 以降のスコープ外（意図的に後回し）
 
 - リッチ CLI (TUI) → Phase 4

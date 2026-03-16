@@ -98,5 +98,92 @@ puddle では以下の方針を採用する:
 1. **1台ゾーンは SINGLE で作成し、`NoRedundancy` 警告を出す**
 2. 利用者にリスクを明示した上で、容量を最大限活用する
 3. 新しいディスク追加で冗長化可能になった場合は、自動的に RAID レベルが昇格する
+4. **遅延割り当て**: 非冗長ゾーンの PV は割り当て禁止にし、冗長ゾーンから先にデータを書き込む (詳細は下記)
 
 この方針は容量効率とシンプルさを優先した設計判断である。
+
+---
+
+## 遅延割り当て (Deferred Allocation)
+
+### 動機
+
+SINGLE ゾーンを即座に LV に組み込むと、冗長ゾーンに空きがあっても LVM がデータを非冗長領域に配置する可能性がある。これではユーザーが意図しないデータ損失リスクを負う。
+
+### 仕組み
+
+LVM の `pvchange -x` (allocatable フラグ) を使い、非冗長ゾーンへの書き込みを制御する。
+
+```
+ディスク追加時:
+  1. 非冗長ゾーンの mdadm アレイ作成        → 通常通り
+  2. pvcreate                               → 通常通り
+  3. VG に追加 (vgextend)                   → 通常通り
+  4. pvchange -x n (割り当て禁止)           → ★ 新規
+  5. LV は冗長ゾーンの PV だけを使用する
+
+冗長ゾーンが満杯になったら:
+  1. monitor が使用率を検知
+  2. 警告表示: "冗長ストレージが XX% です。非冗長領域への拡張が必要です"
+  3. pvchange -x y で割り当て許可
+  4. lvextend + resize2fs で LV を拡張
+  5. status に非冗長領域使用中の警告を常時表示
+```
+
+### 状態遷移
+
+```
+[冗長ゾーンのみ使用]        ← 通常状態
+        │
+        │ 冗長ゾーン使用率がしきい値超過
+        ▼
+[警告: 非冗長領域に拡張]    ← monitor が自動実行 or ユーザー手動
+        │
+        │ 新ディスク追加で全ゾーン冗長化
+        ▼
+[全ゾーン冗長]              ← 警告解消
+```
+
+### メタデータ
+
+`pool.toml` のゾーン情報に `allocatable` フィールドを追加:
+
+```toml
+[[zones]]
+index = 2
+start_bytes = 4000000000000
+size_bytes = 2000000000000
+raid_level = "single"
+md_device = "/dev/md/puddle-z2"
+participating_disk_uuids = ["disk-uuid-3"]
+allocatable = false   # LVM 割り当て禁止 (冗長性なし)
+```
+
+### status 表示
+
+```
+$ puddle status
+Pool: puddle-a1b2c3d4
+State: HEALTHY ✓
+
+Zones:
+  Zone 0  RAID5   3 disks × 2.0 TB  [clean]
+  Zone 1  RAID5   3 disks × 2.0 TB  [clean]
+  Zone 2  SINGLE  1 disk  × 2.0 TB  [reserved — no redundancy] ⚠
+
+Capacity:
+  Protected:   10.0 TB (usable)
+  Unprotected:  2.0 TB (reserved, available if needed)
+  Used:         1.2 TB (12%)
+  Free:         8.8 TB
+```
+
+### しきい値と自動拡張
+
+- **monitor がしきい値 (デフォルト 90%) を監視**
+- しきい値到達時の挙動:
+  - **monitor --webhook 設定時**: webhook 通知を送信
+  - **ログ出力**: 常に syslog/stderr に警告出力
+  - **自動拡張はしない**: ユーザーが明示的に操作する (安全優先)
+- ユーザーは `puddle expand-unprotected --yes` で非冗長領域を手動で有効化
+- 有効化後は status に `⚠ Unprotected storage in use` を常時表示
