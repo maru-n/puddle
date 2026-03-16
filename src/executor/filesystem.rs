@@ -30,6 +30,9 @@ impl<'a, R: CommandRunner> FilesystemManager<'a, R> {
     pub fn resize(&self, device: &str, fs_type: &str) -> Result<()> {
         match fs_type {
             "ext4" => {
+                // e2fsck -f が必要な場合がある (アンマウント状態のリサイズ)
+                // エラーは無視 (マウント中の場合は e2fsck が失敗するが resize2fs は成功する)
+                let _ = self.runner.run("e2fsck", &["-f", "-y", device]);
                 self.runner.run("resize2fs", &[device])?;
             }
             "xfs" => {

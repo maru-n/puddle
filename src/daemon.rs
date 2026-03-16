@@ -21,6 +21,8 @@ pub enum DaemonEvent {
     SmartOk { device: String },
     /// RAID チェック正常完了
     RaidOk { array: String },
+    /// 冗長ストレージの使用率がしきい値超過
+    StorageThreshold { usage_percent: f64, message: String },
 }
 
 /// 1台のディスクの SMART をチェックし、異常があればイベントを返す
@@ -91,6 +93,77 @@ pub fn check_mdstat<R: CommandRunner>(runner: &R) -> Result<Vec<DaemonEvent>> {
     Ok(events)
 }
 
+/// 冗長ストレージの使用率をチェックし、しきい値超過時にイベントを返す
+///
+/// allocatable=false のゾーンがある場合のみ動作。
+/// VG の使用率が 90% 以上なら StorageThreshold イベントを発生させる。
+pub fn check_storage_threshold<R: CommandRunner>(
+    runner: &R,
+    config: &crate::metadata::pool_config::PoolConfig,
+) -> Vec<DaemonEvent> {
+    // 非冗長で予約中のゾーンがなければチェック不要
+    let has_reserved = config.zones.iter().any(|z| !z.allocatable);
+    if !has_reserved {
+        return Vec::new();
+    }
+
+    // vgs で VG の空き容量と合計容量を取得
+    let output = match runner.run(
+        "vgs",
+        &[
+            "--noheadings",
+            "--nosuffix",
+            "--units",
+            "b",
+            "-o",
+            "vg_size,vg_free",
+            &config.lvm.vg_name,
+        ],
+    ) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    let parts: Vec<&str> = output.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+
+    let vg_size: f64 = match parts[0].parse() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let vg_free: f64 = match parts[1].parse() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    if vg_size <= 0.0 {
+        return Vec::new();
+    }
+
+    let usage_percent = (1.0 - vg_free / vg_size) * 100.0;
+
+    if usage_percent >= 90.0 {
+        let unprotected_bytes: u64 = config
+            .zones
+            .iter()
+            .filter(|z| !z.allocatable)
+            .map(|z| z.size_bytes)
+            .sum();
+        let unprotected_tb = unprotected_bytes as f64 / 1_000_000_000_000.0;
+        vec![DaemonEvent::StorageThreshold {
+            usage_percent,
+            message: format!(
+                "Protected storage is {:.0}% full. Run 'puddle expand-unprotected' to use {:.1} TB of unprotected storage.",
+                usage_percent, unprotected_tb
+            ),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
 /// 全デバイスの1回分のポーリングを実行し、イベントを収集する
 pub fn poll_once<R: CommandRunner>(runner: &R, devices: &[String]) -> Vec<DaemonEvent> {
     let mut events = Vec::new();
@@ -144,6 +217,15 @@ pub fn format_event(event: &DaemonEvent) -> String {
         DaemonEvent::RaidOk { array } => {
             format!("[OK] RAID {}: clean", array)
         }
+        DaemonEvent::StorageThreshold {
+            usage_percent,
+            message,
+        } => {
+            format!(
+                "[WARN] Storage threshold: {:.0}% — {}",
+                usage_percent, message
+            )
+        }
     }
 }
 
@@ -151,7 +233,9 @@ pub fn format_event(event: &DaemonEvent) -> String {
 pub fn is_warning(event: &DaemonEvent) -> bool {
     matches!(
         event,
-        DaemonEvent::SmartWarning { .. } | DaemonEvent::RaidDegraded { .. }
+        DaemonEvent::SmartWarning { .. }
+            | DaemonEvent::RaidDegraded { .. }
+            | DaemonEvent::StorageThreshold { .. }
     )
 }
 
@@ -428,5 +512,119 @@ mod tests {
 
         let result = send_webhook(&runner, "http://example.com/hook", &events);
         assert!(result.is_err());
+    }
+
+    fn make_pool_with_reserved_zone() -> crate::metadata::pool_config::PoolConfig {
+        use crate::metadata::pool_config::*;
+        use crate::types::*;
+        use uuid::Uuid;
+
+        let disk0 = Uuid::new_v4();
+        let disk1 = Uuid::new_v4();
+
+        PoolConfig {
+            pool: PoolMeta {
+                uuid: Uuid::new_v4(),
+                name: "puddle-test".to_string(),
+                created_at: "2026-03-10T12:00:00Z".to_string(),
+                redundancy: Redundancy::Single,
+            },
+            disks: vec![
+                DiskMeta {
+                    uuid: disk0,
+                    device_id: "/dev/loop0".to_string(),
+                    capacity_bytes: 2_000_000_000_000,
+                    seq: 0,
+                    status: DiskStatus::Active,
+                },
+                DiskMeta {
+                    uuid: disk1,
+                    device_id: "/dev/loop1".to_string(),
+                    capacity_bytes: 4_000_000_000_000,
+                    seq: 1,
+                    status: DiskStatus::Active,
+                },
+            ],
+            zones: vec![
+                ZoneMeta {
+                    index: 0,
+                    start_bytes: 0,
+                    size_bytes: 2_000_000_000_000,
+                    raid_level: RaidLevel::Raid1,
+                    md_device: "/dev/md/puddle-z0".to_string(),
+                    participating_disk_uuids: vec![disk0, disk1],
+                    allocatable: true,
+                },
+                ZoneMeta {
+                    index: 1,
+                    start_bytes: 2_000_000_000_000,
+                    size_bytes: 2_000_000_000_000,
+                    raid_level: RaidLevel::Single,
+                    md_device: "/dev/md/puddle-z1".to_string(),
+                    participating_disk_uuids: vec![disk1],
+                    allocatable: false,
+                },
+            ],
+            lvm: LvmMeta {
+                vg_name: "puddle-pool".to_string(),
+                lv_name: "data".to_string(),
+                filesystem: "ext4".to_string(),
+                mount_point: "/mnt/pool".to_string(),
+            },
+            state: StateMeta {
+                pool_status: PoolStatus::Healthy,
+                last_scrub: None,
+                version: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn test_storage_threshold_below_90_no_event() {
+        let runner = MockCommandRunner::new();
+        // 89% usage: size=2TB, free=220GB
+        runner.set_stdout("vgs", "  2000000000000 220000000000\n");
+
+        let config = make_pool_with_reserved_zone();
+        let events = check_storage_threshold(&runner, &config);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_storage_threshold_above_90_triggers_event() {
+        let runner = MockCommandRunner::new();
+        // 95% usage: size=2TB, free=100GB
+        runner.set_stdout("vgs", "  2000000000000 100000000000\n");
+
+        let config = make_pool_with_reserved_zone();
+        let events = check_storage_threshold(&runner, &config);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            DaemonEvent::StorageThreshold { usage_percent, message }
+            if *usage_percent >= 90.0 && message.contains("expand-unprotected")
+        ));
+    }
+
+    #[test]
+    fn test_storage_threshold_no_reserved_zones_skips() {
+        let runner = MockCommandRunner::new();
+
+        let mut config = make_pool_with_reserved_zone();
+        // Make all zones allocatable
+        config.zones[1].allocatable = true;
+
+        let events = check_storage_threshold(&runner, &config);
+        assert!(events.is_empty());
+        // vgs should not have been called
+        assert!(runner.history().is_empty());
+    }
+
+    #[test]
+    fn test_storage_threshold_is_warning() {
+        assert!(is_warning(&DaemonEvent::StorageThreshold {
+            usage_percent: 92.0,
+            message: "test".into(),
+        }));
     }
 }

@@ -45,6 +45,7 @@ fn sample_config() -> PoolConfig {
                 raid_level: RaidLevel::Raid5,
                 md_device: "/dev/md/puddle-z0".to_string(),
                 participating_disk_uuids: vec![disk0_uuid, disk1_uuid, disk2_uuid],
+                allocatable: true,
             },
             puddle::metadata::pool_config::ZoneMeta {
                 index: 1,
@@ -53,6 +54,7 @@ fn sample_config() -> PoolConfig {
                 raid_level: RaidLevel::Raid1,
                 md_device: "/dev/md/puddle-z1".to_string(),
                 participating_disk_uuids: vec![disk1_uuid, disk2_uuid],
+                allocatable: true,
             },
         ],
         lvm: puddle::metadata::pool_config::LvmMeta {
@@ -125,4 +127,66 @@ name = "mypool"
 "#;
     let result = PoolConfig::from_toml(incomplete);
     assert!(result.is_err());
+}
+
+// ── Step 28: allocatable フィールド ──
+
+#[test]
+fn test_allocatable_roundtrip() {
+    let mut config = sample_config();
+    config.zones[1].allocatable = false;
+
+    let toml_str = config.to_toml().unwrap();
+    assert!(toml_str.contains("allocatable = false"));
+
+    let restored = PoolConfig::from_toml(&toml_str).unwrap();
+    assert!(restored.zones[0].allocatable);
+    assert!(!restored.zones[1].allocatable);
+}
+
+#[test]
+fn test_allocatable_backward_compat() {
+    // 既存 pool.toml に allocatable フィールドがない場合、true として読み込まれる
+    let toml_without_allocatable = r#"
+[pool]
+uuid = "a1b2c3d4-e5f6-0000-0000-000000000000"
+name = "mypool"
+created_at = "2026-03-10T12:00:00Z"
+redundancy = "single"
+
+[[disks]]
+uuid = "00000000-0000-0000-0000-000000000001"
+device_id = "ata-Samsung_870"
+capacity_bytes = 2000000000000
+seq = 0
+status = "active"
+
+[[zones]]
+index = 0
+start_bytes = 0
+size_bytes = 2000000000000
+raid_level = "single"
+md_device = "/dev/md/puddle-z0"
+participating_disk_uuids = ["00000000-0000-0000-0000-000000000001"]
+
+[lvm]
+vg_name = "puddle-pool"
+lv_name = "data"
+filesystem = "ext4"
+mount_point = "/mnt/pool"
+
+[state]
+pool_status = "healthy"
+version = 2
+"#;
+    let config = PoolConfig::from_toml(toml_without_allocatable).unwrap();
+    assert!(config.zones[0].allocatable);
+}
+
+#[test]
+fn test_is_redundant() {
+    assert!(!puddle::types::RaidLevel::Single.is_redundant());
+    assert!(puddle::types::RaidLevel::Raid1.is_redundant());
+    assert!(puddle::types::RaidLevel::Raid5.is_redundant());
+    assert!(puddle::types::RaidLevel::Raid6.is_redundant());
 }

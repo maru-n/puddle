@@ -38,6 +38,7 @@ fn sample_config() -> PoolConfig {
             raid_level: RaidLevel::Raid1,
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: vec![disk0_uuid, disk1_uuid],
+            allocatable: true,
         }],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),

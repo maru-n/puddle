@@ -14,7 +14,7 @@ use crate::types::*;
 
 /// デバイスの容量をバイト単位で取得する
 fn get_device_capacity<R: CommandRunner>(runner: &R, device: &str) -> Result<u64> {
-    let output = runner.run("lsblk", &["-bno", "SIZE", device])?;
+    let output = runner.run("lsblk", &["-bdno", "SIZE", device])?;
     let capacity: u64 = output
         .trim()
         .parse()
@@ -204,6 +204,7 @@ pub fn init_with_redundancy<R: CommandRunner>(
             raid_level: zone.raid_level,
             md_device: md_dev,
             participating_disk_uuids: vec![disk_uuid],
+            allocatable: true,
         });
     }
 
@@ -435,6 +436,23 @@ pub fn add<R: CommandRunner>(
 
                 let mut disk_uuids = oz.participating_disk_uuids.clone();
                 disk_uuids.push(new_disk_uuid);
+
+                // 遅延割り当て: SINGLE→冗長に昇格した場合、割り当てを許可
+                let allocatable = if !oz.allocatable && new_zone.raid_level.is_redundant() {
+                    let md_dev_ref = md_dev.clone();
+                    run_step(
+                        runner,
+                        &mut oplog,
+                        &format!("Enable allocation on {}", md_dev_ref),
+                        &format!("pvchange -x y {}", md_dev_ref),
+                        &format!("pvchange -x n {}", md_dev_ref),
+                        || vm.pvchange_allocatable(&md_dev_ref, true),
+                    )?;
+                    true
+                } else {
+                    oz.allocatable
+                };
+
                 new_zone_metas.push(ZoneMeta {
                     index: oz.index,
                     start_bytes: new_zone.start_bytes,
@@ -442,6 +460,7 @@ pub fn add<R: CommandRunner>(
                     raid_level: new_zone.raid_level,
                     md_device: md_dev,
                     participating_disk_uuids: disk_uuids,
+                    allocatable,
                 });
             }
             None => {
@@ -473,6 +492,20 @@ pub fn add<R: CommandRunner>(
                     || vm.vgextend(&existing.lvm.vg_name, &md_dev),
                 )?;
 
+                // 遅延割り当て: 非冗長ゾーンは割り当て禁止
+                let allocatable = new_zone.raid_level.is_redundant();
+                if !allocatable {
+                    let md_dev_ref = md_dev.clone();
+                    run_step(
+                        runner,
+                        &mut oplog,
+                        &format!("Disable allocation on {}", md_dev_ref),
+                        &format!("pvchange -x n {}", md_dev_ref),
+                        &format!("pvchange -x y {}", md_dev_ref),
+                        || vm.pvchange_allocatable(&md_dev_ref, false),
+                    )?;
+                }
+
                 new_zone_metas.push(ZoneMeta {
                     index: new_zone.index,
                     start_bytes: new_zone.start_bytes,
@@ -480,6 +513,7 @@ pub fn add<R: CommandRunner>(
                     raid_level: new_zone.raid_level,
                     md_device: md_dev,
                     participating_disk_uuids: vec![new_disk_uuid],
+                    allocatable,
                 });
             }
         }
@@ -826,6 +860,23 @@ pub fn upgrade<R: CommandRunner>(
                 if let Some(pos) = uuids.iter().position(|u| *u == old_disk_uuid) {
                     uuids[pos] = new_disk_uuid;
                 }
+
+                // 遅延割り当て: SINGLE→冗長に昇格した場合、割り当てを許可
+                let allocatable = if !oz.allocatable && new_zone.raid_level.is_redundant() {
+                    let md_dev_ref = md_dev.clone();
+                    run_step(
+                        runner,
+                        &mut oplog,
+                        &format!("Enable allocation on {}", md_dev_ref),
+                        &format!("pvchange -x y {}", md_dev_ref),
+                        &format!("pvchange -x n {}", md_dev_ref),
+                        || vm.pvchange_allocatable(&md_dev_ref, true),
+                    )?;
+                    true
+                } else {
+                    oz.allocatable
+                };
+
                 new_zone_metas.push(ZoneMeta {
                     index: oz.index,
                     start_bytes: new_zone.start_bytes,
@@ -833,6 +884,7 @@ pub fn upgrade<R: CommandRunner>(
                     raid_level: new_zone.raid_level,
                     md_device: md_dev,
                     participating_disk_uuids: uuids,
+                    allocatable,
                 });
             }
             None => {
@@ -863,6 +915,20 @@ pub fn upgrade<R: CommandRunner>(
                     || vm.vgextend(&existing.lvm.vg_name, &md_dev),
                 )?;
 
+                // 遅延割り当て: 非冗長ゾーンは割り当て禁止
+                let allocatable = new_zone.raid_level.is_redundant();
+                if !allocatable {
+                    let md_dev_ref = md_dev.clone();
+                    run_step(
+                        runner,
+                        &mut oplog,
+                        &format!("Disable allocation on {}", md_dev_ref),
+                        &format!("pvchange -x n {}", md_dev_ref),
+                        &format!("pvchange -x y {}", md_dev_ref),
+                        || vm.pvchange_allocatable(&md_dev_ref, false),
+                    )?;
+                }
+
                 new_zone_metas.push(ZoneMeta {
                     index: new_zone.index,
                     start_bytes: new_zone.start_bytes,
@@ -870,6 +936,7 @@ pub fn upgrade<R: CommandRunner>(
                     raid_level: new_zone.raid_level,
                     md_device: md_dev,
                     participating_disk_uuids: vec![new_disk_uuid],
+                    allocatable,
                 });
             }
         }
@@ -1141,6 +1208,85 @@ pub fn remove<R: CommandRunner>(
     oplog.commit();
     let log_path = format!("{}/operations.log", meta_dir);
     oplog.save_to_file(&log_path)?;
+
+    Ok(new_config)
+}
+
+// ────────────────────────────────────────────
+// puddle expand-unprotected
+// ────────────────────────────────────────────
+
+/// 非冗長ゾーンの割り当てを手動で有効化する
+///
+/// allocatable=false のゾーンに対して pvchange -x y → lvextend → resize2fs を実行。
+pub fn expand_unprotected<R: CommandRunner>(
+    runner: &R,
+    existing: &PoolConfig,
+    meta_dir: &str,
+) -> Result<PoolConfig> {
+    let unprotected: Vec<&ZoneMeta> = existing.zones.iter().filter(|z| !z.allocatable).collect();
+
+    if unprotected.is_empty() {
+        bail!("No unprotected zones to expand");
+    }
+
+    let vm = VolumeManager::new(runner);
+    let fm = FilesystemManager::new(runner);
+    let mut oplog = OperationLog::new("expand-unprotected");
+
+    // 各非冗長ゾーンの割り当てを許可
+    let mut new_zones = existing.zones.clone();
+    for zone in &unprotected {
+        run_step(
+            runner,
+            &mut oplog,
+            &format!("Enable allocation on {}", zone.md_device),
+            &format!("pvchange -x y {}", zone.md_device),
+            &format!("pvchange -x n {}", zone.md_device),
+            || vm.pvchange_allocatable(&zone.md_device, true),
+        )?;
+
+        if let Some(zm) = new_zones.iter_mut().find(|z| z.index == zone.index) {
+            zm.allocatable = true;
+        }
+    }
+
+    // LV 拡張 + FS リサイズ
+    let data_lv = lv_path(&existing.lvm.vg_name, &existing.lvm.lv_name);
+    run_step(
+        runner,
+        &mut oplog,
+        "Extend logical volume",
+        &format!("lvextend {}", data_lv),
+        "",
+        || vm.lvextend_full(&data_lv),
+    )?;
+
+    run_step(
+        runner,
+        &mut oplog,
+        "Resize filesystem",
+        &format!("resize2fs {}", data_lv),
+        "",
+        || fm.resize(&data_lv, &existing.lvm.filesystem),
+    )?;
+
+    let new_config = PoolConfig {
+        pool: existing.pool.clone(),
+        disks: existing.disks.clone(),
+        zones: new_zones,
+        lvm: existing.lvm.clone(),
+        state: existing.state.clone(),
+    };
+
+    // メタデータ保存
+    let toml_str = new_config.to_toml()?;
+    let meta_path = format!("{}/pool.toml", meta_dir);
+    std::fs::write(meta_path, toml_str).context("Failed to write pool config")?;
+
+    oplog.commit();
+    let log_path = format!("{}/operations.log", meta_dir);
+    oplog.save_to_file(&log_path).ok();
 
     Ok(new_config)
 }

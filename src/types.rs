@@ -21,6 +21,11 @@ impl RaidLevel {
             RaidLevel::Raid6 => 2,
         }
     }
+
+    /// 冗長性があるかどうか (SINGLE 以外は冗長)
+    pub fn is_redundant(self) -> bool {
+        !matches!(self, RaidLevel::Single)
+    }
 }
 
 /// 冗長性レベル

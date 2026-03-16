@@ -244,5 +244,6 @@ fn test_fs_resize_ext4() {
     fm.resize("/dev/mapper/puddle--pool-data", "ext4").unwrap();
 
     let h = mock.history();
-    assert_eq!(h[0].0, "resize2fs");
+    assert_eq!(h[0].0, "e2fsck");
+    assert_eq!(h[1].0, "resize2fs");
 }

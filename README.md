@@ -87,6 +87,17 @@ sudo puddle remove /dev/sdb --yes
 sudo puddle destroy --yes
 ```
 
+### 非冗長領域の管理
+
+異種容量ディスクを使うと、最大容量ディスクの末尾に冗長性のないゾーン (SINGLE) が発生する場合がある。このゾーンは自動的に「予約」状態になり、冗長ゾーンから先にデータが書き込まれる。
+
+```bash
+# 冗長ストレージが満杯になったら、非冗長領域を手動で有効化
+sudo puddle expand-unprotected --yes
+```
+
+詳細は [docs/DESIGN_NOTES.md](docs/DESIGN_NOTES.md) を参照。
+
 ### 監視・通知
 
 ```bash
@@ -166,6 +177,7 @@ mount /dev/mapper/puddle--pool-data /mnt/recovery
 | `puddle upgrade <old> <new>` | 大容量ディスクに入替え |
 | `puddle remove <device>` | ディスクを安全に除去 |
 | `puddle destroy` | プールを破棄 |
+| `puddle expand-unprotected` | 非冗長領域を手動で有効化 |
 | `puddle monitor` | SMART + RAID 継続監視 |
 
 主要オプション:
@@ -186,6 +198,7 @@ mount /dev/mapper/puddle--pool-data /mnt/recovery
 | Phase 2.5 | 安全性強化 (排他ロック, デバイス検証, エラー処理) | 完了 |
 | Phase 2.7 | 信頼性検証 (プロパティベース, 境界値, 故障注入テスト) | 完了 |
 | Phase 3 | RAID6, デーモン, webhook, ディスク除去 | 完了 |
+| Phase 3.5 | 遅延割り当て (非冗長ゾーンの安全な容量管理) | 完了 |
 | Phase 4 | リッチ CLI (TUI) | 未着手 |
 
 詳細は [docs/SPEC.md](docs/SPEC.md) (設計書) と [plan.md](plan.md) (実装計画) を参照。

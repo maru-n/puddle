@@ -573,6 +573,7 @@ fn make_single_disk_pool(capacity: u64) -> puddle::metadata::pool_config::PoolCo
             raid_level: RaidLevel::Single,
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: vec![disk_uuid],
+            allocatable: true,
         }],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),

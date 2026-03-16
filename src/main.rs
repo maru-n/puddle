@@ -81,6 +81,12 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Enable allocation on non-redundant (SINGLE) zones
+    ExpandUnprotected {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Run continuous monitoring daemon (SMART + RAID)
     Monitor {
         /// Run once and exit (no loop)
@@ -361,6 +367,59 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
+        Commands::ExpandUnprotected { yes } => {
+            let meta_path = format!("{}/pool.toml", META_DIR);
+            let toml_str = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: No existing pool found at {}: {}", meta_path, e);
+                    std::process::exit(1);
+                }
+            };
+            let existing = match PoolConfig::from_toml(&toml_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: Failed to parse pool config: {}", e);
+                    eprintln!("The pool configuration may be corrupted.");
+                    std::process::exit(1);
+                }
+            };
+
+            let unprotected: Vec<_> = existing.zones.iter().filter(|z| !z.allocatable).collect();
+
+            if unprotected.is_empty() {
+                eprintln!("No unprotected zones to expand.");
+                std::process::exit(1);
+            }
+
+            if !yes {
+                use puddle::planner::capacity::format_bytes;
+                println!("WARNING: Enabling allocation on non-redundant zones:");
+                for z in &unprotected {
+                    println!(
+                        "  Zone {}: {} ({:?}, {} disk)",
+                        z.index,
+                        format_bytes(z.size_bytes),
+                        z.raid_level,
+                        z.participating_disk_uuids.len()
+                    );
+                }
+                println!("  Data in these zones has NO redundancy protection.");
+                if !confirm("Proceed?") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
+
+            match commands::expand_unprotected(&runner, &existing, META_DIR) {
+                Ok(_config) => {
+                    println!("Non-redundant storage enabled.");
+                    println!("WARNING: puddle status will show a persistent warning.");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
         Commands::Destroy { yes } => {
             let meta_path = format!("{}/pool.toml", META_DIR);
             let toml_str = match std::fs::read_to_string(&meta_path) {
@@ -427,7 +486,8 @@ fn main() {
                 let devices: Vec<String> =
                     config.disks.iter().map(|d| d.device_id.clone()).collect();
 
-                let events = daemon::poll_once(&runner, &devices);
+                let mut events = daemon::poll_once(&runner, &devices);
+                events.extend(daemon::check_storage_threshold(&runner, &config));
                 for event in &events {
                     println!("{}", daemon::format_event(event));
                 }
@@ -447,15 +507,11 @@ fn main() {
 
                 loop {
                     // 毎回 pool.toml を読み直す (init 後に自動で検知)
-                    let devices = match std::fs::read_to_string(&meta_path)
+                    let config = match std::fs::read_to_string(&meta_path)
                         .ok()
                         .and_then(|s| PoolConfig::from_toml(&s).ok())
                     {
-                        Some(config) => config
-                            .disks
-                            .iter()
-                            .map(|d| d.device_id.clone())
-                            .collect::<Vec<_>>(),
+                        Some(c) => c,
                         None => {
                             // プール未作成 — 静かに待機
                             std::thread::sleep(poll_interval);
@@ -463,7 +519,10 @@ fn main() {
                         }
                     };
 
-                    let events = daemon::poll_once(&runner, &devices);
+                    let devices: Vec<String> =
+                        config.disks.iter().map(|d| d.device_id.clone()).collect();
+                    let mut events = daemon::poll_once(&runner, &devices);
+                    events.extend(daemon::check_storage_threshold(&runner, &config));
                     for event in &events {
                         if daemon::is_warning(event) {
                             println!("{}", daemon::format_event(event));
@@ -640,6 +699,16 @@ fn print_add_result(config: &PoolConfig) {
     }
 }
 
+fn zone_effective_bytes(zone: &puddle::metadata::pool_config::ZoneMeta) -> u64 {
+    let n = zone.participating_disk_uuids.len() as u64;
+    match zone.raid_level {
+        puddle::types::RaidLevel::Single => zone.size_bytes,
+        puddle::types::RaidLevel::Raid1 => zone.size_bytes,
+        puddle::types::RaidLevel::Raid5 => zone.size_bytes * (n - 1),
+        puddle::types::RaidLevel::Raid6 => zone.size_bytes * (n - 2),
+    }
+}
+
 fn print_status(config: &PoolConfig) {
     use puddle::planner::capacity::format_bytes;
 
@@ -666,20 +735,64 @@ fn print_status(config: &PoolConfig) {
 
     println!("Zones:");
     for zone in &config.zones {
+        let status = if !zone.raid_level.is_redundant() {
+            if zone.allocatable {
+                " [active — NO REDUNDANCY] ⚠"
+            } else {
+                " [reserved — no redundancy] ⚠"
+            }
+        } else {
+            ""
+        };
         println!(
-            "  Zone {} {:?} {} disks x {} {}",
+            "  Zone {} {:?} {} disks x {} {}{}",
             zone.index,
             zone.raid_level,
             zone.participating_disk_uuids.len(),
             format_bytes(zone.size_bytes),
             zone.md_device,
+            status,
         );
     }
     println!();
 
     let total_physical: u64 = config.disks.iter().map(|d| d.capacity_bytes).sum();
+    let protected: u64 = config
+        .zones
+        .iter()
+        .filter(|z| z.raid_level.is_redundant())
+        .map(zone_effective_bytes)
+        .sum();
+    let unprotected_reserved: u64 = config
+        .zones
+        .iter()
+        .filter(|z| !z.raid_level.is_redundant() && !z.allocatable)
+        .map(zone_effective_bytes)
+        .sum();
+    let unprotected_active: u64 = config
+        .zones
+        .iter()
+        .filter(|z| !z.raid_level.is_redundant() && z.allocatable)
+        .map(zone_effective_bytes)
+        .sum();
+
     println!("Capacity:");
     println!("  Physical: {}", format_bytes(total_physical));
+    if protected > 0 {
+        println!("  Protected: {}", format_bytes(protected));
+    }
+    if unprotected_reserved > 0 {
+        println!(
+            "  Unprotected: {} (reserved)",
+            format_bytes(unprotected_reserved)
+        );
+    }
+    if unprotected_active > 0 {
+        println!(
+            "  Unprotected: {} (IN USE — no redundancy) ⚠",
+            format_bytes(unprotected_active)
+        );
+    }
     println!();
 
     println!(

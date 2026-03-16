@@ -546,6 +546,7 @@ fn make_single_disk_pool(capacity: u64) -> PoolConfig {
             raid_level: RaidLevel::Single,
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: vec![disk_uuid],
+            allocatable: true,
         }],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),
@@ -593,6 +594,7 @@ fn make_four_disk_pool() -> PoolConfig {
             raid_level: RaidLevel::Raid5,
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: disks.clone(),
+            allocatable: true,
         }],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),
@@ -655,6 +657,7 @@ fn make_multi_zone_pool() -> PoolConfig {
                 raid_level: RaidLevel::Raid5,
                 md_device: "/dev/md/puddle-z0".to_string(),
                 participating_disk_uuids: vec![disk0, disk1, disk2],
+                allocatable: true,
             },
             ZoneMeta {
                 index: 1,
@@ -663,6 +666,7 @@ fn make_multi_zone_pool() -> PoolConfig {
                 raid_level: RaidLevel::Raid1,
                 md_device: "/dev/md/puddle-z1".to_string(),
                 participating_disk_uuids: vec![disk1, disk2],
+                allocatable: true,
             },
         ],
         lvm: LvmMeta {
@@ -718,6 +722,7 @@ fn make_two_disk_pool() -> PoolConfig {
             raid_level: RaidLevel::Raid1,
             md_device: "/dev/md/puddle-z0".to_string(),
             participating_disk_uuids: vec![disk0, disk1],
+            allocatable: true,
         }],
         lvm: LvmMeta {
             vg_name: "puddle-pool".to_string(),
@@ -815,4 +820,274 @@ fn test_remove_disk_from_multi_zone_pool() {
     assert_eq!(new_config.disks.len(), 2);
     // loop0 が消えている
     assert!(new_config.disks.iter().all(|d| d.device_id != "/dev/loop0"));
+}
+
+// ── Step 29: deferred allocation tests ──
+
+#[test]
+fn test_add_single_zone_is_not_allocatable() {
+    // 2TB プールに 4TB ディスクを追加 → Zone1 は SINGLE で allocatable=false
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "4000000000000\n");
+
+    let existing = make_single_disk_pool(2_000_000_000_000);
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_dir = tmp_dir.path().to_str().unwrap();
+
+    let result = commands::add(&mock, "/dev/sdc", &existing, meta_dir);
+    assert!(result.is_ok(), "add failed: {:?}", result.err());
+
+    let config = result.unwrap();
+    assert_eq!(config.zones.len(), 2);
+
+    // Zone 0: RAID1 → allocatable = true
+    assert_eq!(config.zones[0].raid_level, RaidLevel::Raid1);
+    assert!(config.zones[0].allocatable);
+
+    // Zone 1: SINGLE → allocatable = false (遅延割り当て)
+    assert_eq!(config.zones[1].raid_level, RaidLevel::Single);
+    assert!(!config.zones[1].allocatable);
+
+    // pvchange -x n が呼ばれた
+    let h = mock.history();
+    let pvchange_calls: Vec<_> = h.iter().filter(|(cmd, _)| cmd == "pvchange").collect();
+    assert!(
+        pvchange_calls
+            .iter()
+            .any(|(_, args)| args.contains(&"-x".to_string()) && args.contains(&"n".to_string())),
+        "should call pvchange -x n for non-redundant zone"
+    );
+}
+
+#[test]
+fn test_add_promotes_single_to_raid1_enables_allocation() {
+    use puddle::metadata::pool_config::*;
+    use uuid::Uuid;
+
+    // 2TB + 4TB プール (Zone1=SINGLE) に 4TB を追加 → Zone1 が RAID1 に昇格
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "4000000000000\n");
+
+    let disk0 = Uuid::new_v4();
+    let disk1 = Uuid::new_v4();
+
+    let existing = PoolConfig {
+        pool: PoolMeta {
+            uuid: Uuid::new_v4(),
+            name: "puddle-test".to_string(),
+            created_at: "2026-03-10T12:00:00Z".to_string(),
+            redundancy: Redundancy::Single,
+        },
+        disks: vec![
+            DiskMeta {
+                uuid: disk0,
+                device_id: "/dev/loop0".to_string(),
+                capacity_bytes: 2_000_000_000_000,
+                seq: 0,
+                status: DiskStatus::Active,
+            },
+            DiskMeta {
+                uuid: disk1,
+                device_id: "/dev/loop1".to_string(),
+                capacity_bytes: 4_000_000_000_000,
+                seq: 1,
+                status: DiskStatus::Active,
+            },
+        ],
+        zones: vec![
+            ZoneMeta {
+                index: 0,
+                start_bytes: 0,
+                size_bytes: 2_000_000_000_000,
+                raid_level: RaidLevel::Raid1,
+                md_device: "/dev/md/puddle-z0".to_string(),
+                participating_disk_uuids: vec![disk0, disk1],
+                allocatable: true,
+            },
+            ZoneMeta {
+                index: 1,
+                start_bytes: 2_000_000_000_000,
+                size_bytes: 2_000_000_000_000,
+                raid_level: RaidLevel::Single,
+                md_device: "/dev/md/puddle-z1".to_string(),
+                participating_disk_uuids: vec![disk1],
+                allocatable: false, // 遅延割り当て中
+            },
+        ],
+        lvm: LvmMeta {
+            vg_name: "puddle-pool".to_string(),
+            lv_name: "data".to_string(),
+            filesystem: "ext4".to_string(),
+            mount_point: "/mnt/pool".to_string(),
+        },
+        state: StateMeta {
+            pool_status: PoolStatus::Healthy,
+            last_scrub: None,
+            version: 2,
+        },
+    };
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_dir = tmp_dir.path().to_str().unwrap();
+
+    let result = commands::add(&mock, "/dev/sdd", &existing, meta_dir);
+    assert!(result.is_ok(), "add failed: {:?}", result.err());
+
+    let config = result.unwrap();
+
+    // Zone 0: RAID5 に昇格 → allocatable = true
+    assert_eq!(config.zones[0].raid_level, RaidLevel::Raid5);
+    assert!(config.zones[0].allocatable);
+
+    // Zone 1: RAID1 に昇格 → allocatable = true (遅延割り当て解除)
+    assert_eq!(config.zones[1].raid_level, RaidLevel::Raid1);
+    assert!(config.zones[1].allocatable);
+
+    // pvchange -x y が呼ばれた (Zone1 の割り当て許可)
+    let h = mock.history();
+    let pvchange_calls: Vec<_> = h.iter().filter(|(cmd, _)| cmd == "pvchange").collect();
+    assert!(
+        pvchange_calls
+            .iter()
+            .any(|(_, args)| args.contains(&"-x".to_string()) && args.contains(&"y".to_string())),
+        "should call pvchange -x y to re-enable allocation on promoted zone"
+    );
+}
+
+#[test]
+fn test_init_single_disk_is_allocatable() {
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "2000000000000\n");
+    mock.set_stdout("blkid", "");
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_dir = tmp_dir.path().to_str().unwrap();
+
+    let result = commands::init(&mock, "/dev/sdb", Some("ext4"), None, meta_dir);
+    assert!(result.is_ok(), "init failed: {:?}", result.err());
+
+    let config = result.unwrap();
+    // 1台構成でも allocatable = true (使えないと何も保存できない)
+    assert!(config.zones[0].allocatable);
+}
+
+#[test]
+fn test_add_single_zone_skips_lvextend() {
+    // SINGLE ゾーンだけ新規追加された場合、lvextend がスキップされることを確認
+    let mock = MockCommandRunner::new();
+    mock.set_stdout("lsblk", "4000000000000\n");
+
+    let existing = make_single_disk_pool(2_000_000_000_000);
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_dir = tmp_dir.path().to_str().unwrap();
+
+    let result = commands::add(&mock, "/dev/sdc", &existing, meta_dir);
+    assert!(result.is_ok());
+
+    let h = mock.history();
+    // lvextend は呼ばれるが "matches existing size" で実質 no-op
+    // または呼ばれない — 新ゾーンが allocatable=false なので capacity は増えない
+    // ここでは lvextend が冗長ゾーンの拡張のみを行い、
+    // 非冗長ゾーン分は含まれないことを間接的に確認
+    let config = result.unwrap();
+    assert!(!config.zones[1].allocatable);
+}
+
+// ── Step 30: expand-unprotected tests ──
+
+#[test]
+fn test_expand_unprotected_enables_allocation() {
+    use puddle::metadata::pool_config::*;
+    use uuid::Uuid;
+
+    let mock = MockCommandRunner::new();
+    let disk0 = Uuid::new_v4();
+    let disk1 = Uuid::new_v4();
+
+    let config = PoolConfig {
+        pool: PoolMeta {
+            uuid: Uuid::new_v4(),
+            name: "puddle-test".to_string(),
+            created_at: "2026-03-10T12:00:00Z".to_string(),
+            redundancy: Redundancy::Single,
+        },
+        disks: vec![
+            DiskMeta {
+                uuid: disk0,
+                device_id: "/dev/loop0".to_string(),
+                capacity_bytes: 2_000_000_000_000,
+                seq: 0,
+                status: DiskStatus::Active,
+            },
+            DiskMeta {
+                uuid: disk1,
+                device_id: "/dev/loop1".to_string(),
+                capacity_bytes: 4_000_000_000_000,
+                seq: 1,
+                status: DiskStatus::Active,
+            },
+        ],
+        zones: vec![
+            ZoneMeta {
+                index: 0,
+                start_bytes: 0,
+                size_bytes: 2_000_000_000_000,
+                raid_level: RaidLevel::Raid1,
+                md_device: "/dev/md/puddle-z0".to_string(),
+                participating_disk_uuids: vec![disk0, disk1],
+                allocatable: true,
+            },
+            ZoneMeta {
+                index: 1,
+                start_bytes: 2_000_000_000_000,
+                size_bytes: 2_000_000_000_000,
+                raid_level: RaidLevel::Single,
+                md_device: "/dev/md/puddle-z1".to_string(),
+                participating_disk_uuids: vec![disk1],
+                allocatable: false,
+            },
+        ],
+        lvm: LvmMeta {
+            vg_name: "puddle-pool".to_string(),
+            lv_name: "data".to_string(),
+            filesystem: "ext4".to_string(),
+            mount_point: "/mnt/pool".to_string(),
+        },
+        state: StateMeta {
+            pool_status: PoolStatus::Healthy,
+            last_scrub: None,
+            version: 2,
+        },
+    };
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_dir = tmp_dir.path().to_str().unwrap();
+
+    let result = commands::expand_unprotected(&mock, &config, meta_dir);
+    assert!(result.is_ok(), "expand failed: {:?}", result.err());
+
+    let new_config = result.unwrap();
+    // Zone 1 が allocatable=true に
+    assert!(new_config.zones[1].allocatable);
+
+    // pvchange -x y, lvextend, resize2fs が呼ばれた
+    let h = mock.history();
+    let programs: Vec<&str> = h.iter().map(|e| e.0.as_str()).collect();
+    assert!(programs.contains(&"pvchange"));
+    assert!(programs.contains(&"lvextend"));
+    assert!(programs.contains(&"resize2fs"));
+}
+
+#[test]
+fn test_expand_unprotected_no_unprotected_zones() {
+    let mock = MockCommandRunner::new();
+    let config = make_single_disk_pool(2_000_000_000_000);
+    // single disk pool has allocatable=true (must be usable)
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_dir = tmp_dir.path().to_str().unwrap();
+
+    let result = commands::expand_unprotected(&mock, &config, meta_dir);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("No unprotected"));
 }

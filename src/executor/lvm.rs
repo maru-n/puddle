@@ -59,6 +59,13 @@ impl<'a, R: CommandRunner> VolumeManager<'a, R> {
         Ok(())
     }
 
+    /// PV の allocatable フラグを変更する (遅延割り当て用)
+    pub fn pvchange_allocatable(&self, pv: &str, allocatable: bool) -> Result<()> {
+        let flag = if allocatable { "y" } else { "n" };
+        self.runner.run("pvchange", &["-x", flag, pv])?;
+        Ok(())
+    }
+
     /// Logical Volume を拡張 (VG の全空き領域を使用)
     ///
     /// 空き領域がない場合 (RAID1ミラー追加時など) はスキップする。

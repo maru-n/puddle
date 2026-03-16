@@ -32,6 +32,13 @@ pub struct ZoneMeta {
     pub raid_level: RaidLevel,
     pub md_device: String,
     pub participating_disk_uuids: Vec<Uuid>,
+    /// LVM 割り当て可能かどうか (非冗長ゾーンは false で遅延割り当て)
+    #[serde(default = "default_allocatable")]
+    pub allocatable: bool,
+}
+
+fn default_allocatable() -> bool {
+    true
 }
 
 /// LVM のメタ情報
